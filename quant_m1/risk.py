@@ -1,0 +1,153 @@
+"""Reachable fill states, certified convex functionals, constraint checks,
+reservation recomputation. All integer arithmetic."""
+from __future__ import annotations
+import itertools
+from dataclasses import dataclass
+from .core import (Money, Shares, BPS, Mandate, Instrument, WorkingOrder,
+                   VerifiedState, ceil_bps, floor_bps)
+
+
+@dataclass(frozen=True)
+class SimState:
+    positions: dict[str, Shares]
+    cash_settled: Money
+    receivable_total: Money
+    nav: Money
+
+
+def simulate(base: VerifiedState, orders: tuple[WorkingOrder, ...],
+             nums: tuple[int, ...], den: int, instruments: dict[str, Instrument],
+             settle_lag: int) -> SimState:
+    """Apply fill fractions nums[j]/den to each order's REMAINING quantity.
+    Integer-exact. Sells create receivables, never settled cash."""
+    pos = dict(base.positions)
+    cash = base.cash_settled
+    recv = base.receivable_total()
+    for o, num in zip(orders, nums):
+        q = o.remaining * num // den
+        if q == 0:
+            continue
+        notional = q * o.price
+        cost = ceil_bps(notional, o.cost_bps)
+        if o.side == "BUY":
+            pos[o.symbol] = pos.get(o.symbol, 0) + q
+            cash -= notional + cost
+        else:
+            pos[o.symbol] = pos.get(o.symbol, 0) - q
+            recv += notional - cost
+    nav = cash + recv + sum(q * base.marks[s] for s, q in pos.items() if q)
+    return SimState(pos, cash, recv, nav)
+
+
+def vertices(m: int):
+    return itertools.product((0, 1), repeat=m)
+
+
+def scenario_nav(sim: SimState, marks: dict[str, int]) -> Money:
+    return sim.cash_settled + sim.receivable_total + sum(
+        q * marks[s] for s, q in sim.positions.items() if q)
+
+
+@dataclass(frozen=True)
+class Usage:
+    gross: Money
+    issuer_max: Money
+    factor_abs: Money
+    worst_loss: Money
+    cvar: Money
+    neg_cash: Money
+
+
+def usage(sim: SimState, base_nav: Money, instruments: dict[str, Instrument],
+          scenarios: tuple[dict[str, int], ...], q_bps: int) -> Usage:
+    gross = sum(q * sim_nav_mark for q, sim_nav_mark in
+                ((q, 0) for q in []))  # placeholder removed below
+    gross = 0
+    issuer: dict[str, int] = {}
+    factor = 0
+    for sym, q in sim.positions.items():
+        if q == 0:
+            continue
+        inst = instruments[sym]
+        val = q * _mark_cache[sym]
+        gross += val
+        for iss, w in inst.lookthrough():
+            issuer[iss] = issuer.get(iss, 0) + ceil_bps(val, w)
+        factor += inst.beta_bps * val
+    losses = sorted((base_nav - scenario_nav(sim, sc) for sc in scenarios), reverse=True)
+    k = max(1, (len(losses) * q_bps + BPS - 1) // BPS)
+    k = min(k, len(losses))
+    cvar = sum(losses[:k]) // k
+    return Usage(gross, max(issuer.values(), default=0), abs(factor) // BPS,
+                 max(losses), cvar, -sim.cash_settled)
+
+
+_mark_cache: dict[str, int] = {}
+
+
+def set_marks(marks: dict[str, int]) -> None:
+    _mark_cache.clear(); _mark_cache.update(marks)
+
+
+CONSTRAINTS = ("gross", "issuer_max", "factor_abs", "worst_loss", "cvar", "neg_cash")
+
+
+@dataclass(frozen=True)
+class Evaluation:
+    ok: bool
+    reason: str
+    max_usage: dict[str, int]
+    base_usage: dict[str, int]
+    nav_min: Money
+    risk_reducing: bool
+    n_vertices: int
+
+
+def evaluate(base: VerifiedState, orders: tuple[WorkingOrder, ...],
+             instruments: dict[str, Instrument], mandate: Mandate,
+             scenarios: tuple[dict[str, int], ...]) -> Evaluation:
+    m = len(orders)
+    if m > 6:
+        return Evaluation(False, "M_VERTEX_EXCEEDED", {}, {}, 0, False, 0)
+    set_marks(base.marks)
+    nav0 = base.nav()
+    base_sim = simulate(base, orders, (0,) * m, 1, instruments, mandate.settle_lag_days)
+    bu = usage(base_sim, nav0, instruments, scenarios, mandate.cvar_q_bps)
+    base_d = {c: getattr(bu, c) for c in CONSTRAINTS}
+
+    max_d = {c: -10**30 for c in CONSTRAINTS}
+    nav_min = 10**30
+    n = 0
+    for v in vertices(m):
+        n += 1
+        sim = simulate(base, orders, v, 1, instruments, mandate.settle_lag_days)
+        if any(q < 0 for q in sim.positions.values()):
+            return Evaluation(False, "SHORT_REACHABLE", {}, {}, 0, False, n)
+        if sim.cash_settled < 0:
+            return Evaluation(False, "SETTLED_CASH_NEGATIVE", {}, {}, 0, False, n)
+        nav_min = min(nav_min, sim.nav)
+        u = usage(sim, nav0, instruments, scenarios, mandate.cvar_q_bps)
+        for c in CONSTRAINTS:
+            max_d[c] = max(max_d[c], getattr(u, c))
+
+    if nav_min <= 0:
+        return Evaluation(False, "NAV_NONPOSITIVE", max_d, base_d, nav_min, False, n)
+
+    checks = (
+        ("gross", max_d["gross"], floor_bps(nav_min, mandate.gross_bps), "GROSS"),
+        ("issuer_max", max_d["issuer_max"], floor_bps(nav_min, mandate.issuer_bps), "ISSUER"),
+        ("factor_abs", max_d["factor_abs"], floor_bps(nav_min, mandate.factor_bps), "FACTOR"),
+        ("worst_loss", max_d["worst_loss"], floor_bps(nav0, mandate.worst_loss_bps), "WORST_LOSS"),
+        ("cvar", max_d["cvar"], floor_bps(nav0, mandate.cvar_bps), "CVAR"),
+    )
+    for _, got, lim, name in checks:
+        if got > lim:
+            return Evaluation(False, f"LIMIT_{name}", max_d, base_d, nav_min, False, n)
+
+    reducing = all(max_d[c] <= base_d[c] for c in CONSTRAINTS)
+    return Evaluation(True, "OK", max_d, base_d, nav_min, reducing, n)
+
+
+def reservations(ev: Evaluation) -> dict[str, int]:
+    """INV-03: reserved = max_vertex_usage - verified_usage. Recomputed, never decremented."""
+    return {c: ev.max_usage[c] - ev.base_usage[c] for c in CONSTRAINTS}

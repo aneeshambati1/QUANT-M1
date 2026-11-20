@@ -1,25 +1,23 @@
-"""Core: units, config authority, clock, event log, ledger, settlement.
-All money in integer cents. All quantities in whole shares. No floats in ledger math.
-"""
+"""Core M1.1: integer units, config authority, durable ledger and state."""
 from __future__ import annotations
 import hashlib, hmac, json, os, tempfile
 from dataclasses import dataclass, field, asdict
 from typing import Any
 
-Money = int      # cents
+Money = int  # cents
 Shares = int
 BPS = 10_000
 
 
 def ceil_bps(amount: int, bps: int) -> int:
-    """Conservative (round-up) bps charge. Never understates a cost."""
-    assert amount >= 0 and bps >= 0
+    if amount < 0 or bps < 0:
+        raise ValueError("amount and bps must be nonnegative")
     return (amount * bps + BPS - 1) // BPS
 
 
 def floor_bps(amount: int, bps: int) -> int:
-    """Conservative (round-down) bps allowance. Never overstates a capacity."""
-    assert amount >= 0 and bps >= 0
+    if amount < 0 or bps < 0:
+        raise ValueError("amount and bps must be nonnegative")
     return amount * bps // BPS
 
 
@@ -31,7 +29,6 @@ def sha(obj: Any) -> str:
     return hashlib.sha256(canonical(obj).encode()).hexdigest()
 
 
-# ---------------------------------------------------------------- config
 @dataclass(frozen=True)
 class ImmutableFloor:
     long_only: bool = True
@@ -68,7 +65,8 @@ class Mandate:
     product_classes: frozenset[str] = frozenset({"PLAIN_ETF"})
 
     def digest(self) -> str:
-        d = asdict(self); d["allowlist"] = sorted(self.allowlist)
+        d = asdict(self)
+        d["allowlist"] = sorted(self.allowlist)
         d["product_classes"] = sorted(self.product_classes)
         return sha(d)
 
@@ -98,16 +96,14 @@ class ConfigAuthority:
         self._floor_digest = self.floor.digest()
 
     def apply_config(self, diff: dict) -> None:
-        """Ordinary CONFIG may never touch immutable floors (INV-14)."""
         illegal = IMMUTABLE_FIELDS & set(diff)
         if illegal:
             raise ConfigAuthorityError(f"CONFIG attempted immutable change: {sorted(illegal)}")
         if "mandate" in diff:
-            self.mandate = Mandate(**{**asdict(self.mandate), **diff["mandate"],
-                                      "allowlist": frozenset(diff["mandate"].get(
-                                          "allowlist", self.mandate.allowlist)),
-                                      "product_classes": frozenset(diff["mandate"].get(
-                                          "product_classes", self.mandate.product_classes)),
+            md = dict(diff["mandate"])
+            md["allowlist"] = frozenset(md.get("allowlist", self.mandate.allowlist))
+            md["product_classes"] = frozenset(md.get("product_classes", self.mandate.product_classes))
+            self.mandate = Mandate(**{**asdict(self.mandate), **md,
                                       "version": self.mandate.version + 1})
         if "ops" in diff:
             self.ops = Operational(**{**asdict(self.ops), **diff["ops"],
@@ -117,9 +113,7 @@ class ConfigAuthority:
         return hmac.compare_digest(self.floor.digest(), self._floor_digest)
 
 
-# ---------------------------------------------------------------- clock
 class Clock:
-    """Monotonic sequence is authoritative. Wall time is advisory only."""
     def __init__(self, seq: int = 0, wall: int = 1_000_000):
         self._seq, self._wall = seq, wall
 
@@ -136,25 +130,38 @@ class Clock:
         return self._wall
 
     def advance_wall(self, dt: int) -> None:
+        if dt < 0:
+            raise ValueError("wall clock cannot be advanced by a negative duration")
         self._wall += dt
 
     def skew_wall(self, dt: int) -> None:
-        """Inject skew. Must NOT affect sequence-based expiry."""
         self._wall += dt
 
 
-# ---------------------------------------------------------------- durable store
+@dataclass
 class Store:
-    def __init__(self, path: str):
-        self.path = path
+    path: str
 
     def save(self, obj: Any) -> None:
         d = os.path.dirname(self.path) or "."
         os.makedirs(d, exist_ok=True)
         fd, tmp = tempfile.mkstemp(dir=d)
-        with os.fdopen(fd, "w") as f:
-            f.write(canonical(obj)); f.flush(); os.fsync(f.fileno())
-        os.replace(tmp, self.path)
+        try:
+            with os.fdopen(fd, "w") as f:
+                f.write(canonical(obj))
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp, self.path)
+            # Persist directory entry where supported.
+            try:
+                dfd = os.open(d, os.O_DIRECTORY)
+                try: os.fsync(dfd)
+                finally: os.close(dfd)
+            except (AttributeError, OSError):
+                pass
+        finally:
+            if os.path.exists(tmp):
+                os.unlink(tmp)
 
     def load(self) -> Any | None:
         if not os.path.exists(self.path):
@@ -163,7 +170,6 @@ class Store:
             return json.load(f)
 
 
-# ---------------------------------------------------------------- event log
 @dataclass
 class EventLog:
     store: Store
@@ -183,41 +189,48 @@ class EventLog:
     def restore(self) -> None:
         data = self.store.load()
         self.chain = data if data else []
+        prev = "0" * 64
+        for rec in self.chain:
+            supplied = rec.get("hash")
+            body = {k: v for k, v in rec.items() if k != "hash"}
+            expected = hashlib.sha256((prev + canonical(body)).encode()).hexdigest()
+            if rec.get("prev") != prev or supplied != expected:
+                raise ValueError("event log hash-chain verification failed")
+            prev = supplied
 
 
-# ---------------------------------------------------------------- instruments
 @dataclass(frozen=True)
 class Instrument:
     symbol: str
     product_class: str
     adv: Money
     beta_bps: int
-    holdings: tuple[tuple[str, int], ...] | None  # (issuer, weight_bps) or None
+    holdings: tuple[tuple[str, int], ...] | None
     halted: bool = False
 
     def lookthrough(self) -> tuple[tuple[str, int], ...]:
-        """A2: missing holdings => 100% single-issuer upper bound. Not a sector proxy."""
         if self.holdings is None:
             return ((f"UNK:{self.symbol}", BPS),)
         tot = sum(w for _, w in self.holdings)
-        if tot != BPS:
+        if tot != BPS or any(w < 0 for _, w in self.holdings):
             return ((f"UNK:{self.symbol}", BPS),)
         return self.holdings
 
 
-# ---------------------------------------------------------------- orders
 @dataclass
 class WorkingOrder:
     order_id: str
     symbol: str
-    side: str            # BUY | SELL
+    side: str
     qty: Shares
     cum_filled: Shares
-    price: Money         # execution price, cents
+    price: Money
     cost_bps: int
     status: str
     trade_date: int
     nonce: str
+    filled_notional: Money = 0
+    filled_cost: Money = 0
 
     @property
     def remaining(self) -> Shares:
@@ -233,7 +246,7 @@ class VerifiedState:
     seq: int
     trade_date: int
     cash_settled: Money
-    receivables: tuple[tuple[int, Money], ...]   # (settle_day, cents)
+    receivables: tuple[tuple[int, Money], ...]
     positions: dict[str, Shares]
     marks: dict[str, Money]
     mark_wall: int
@@ -246,6 +259,8 @@ class VerifiedState:
         return sum(c for _, c in self.receivables)
 
     def nav(self) -> Money:
+        if any(s not in self.marks for s, q in self.positions.items() if q):
+            raise ValueError("position has no current mark")
         return (self.cash_settled + self.receivable_total()
                 + sum(q * self.marks[s] for s, q in self.positions.items() if q))
 
@@ -254,12 +269,11 @@ class VerifiedState:
             "seq": self.seq, "date": self.trade_date, "cash": self.cash_settled,
             "recv": sorted(self.receivables), "pos": self.positions,
             "marks": self.marks, "peak": self.peak_nav,
-            "working": [(o.order_id, o.cum_filled, o.status, o.qty) for o in self.working],
+            "working": [asdict(o) for o in self.working],
             "mv": self.mandate_version, "cd": self.config_digest,
         })
 
 
-# ---------------------------------------------------------------- ledger
 @dataclass
 class Ledger:
     store: Store
@@ -268,6 +282,7 @@ class Ledger:
     applied_exec_ids: set[str] = field(default_factory=set)
     submit_seq: list[int] = field(default_factory=list)
     reserved: dict[str, int] = field(default_factory=dict)
+    applied_exec_hashes: dict[str, str] = field(default_factory=dict)
 
     def persist(self) -> None:
         self.store.save({
@@ -283,6 +298,7 @@ class Ledger:
             },
             "spent_nonces": sorted(self.spent_nonces),
             "applied_exec_ids": sorted(self.applied_exec_ids),
+            "applied_exec_hashes": self.applied_exec_hashes,
             "submit_seq": self.submit_seq,
             "reserved": self.reserved,
         })
@@ -293,23 +309,26 @@ class Ledger:
         if d is None:
             return None
         s = d["state"]
+        working = []
+        for item in s["working"]:
+            # Backward compatible with pre-M1.1 ledgers.
+            working.append(WorkingOrder(**item))
         st = VerifiedState(
             seq=s["seq"], trade_date=s["trade_date"], cash_settled=s["cash_settled"],
             receivables=tuple(tuple(x) for x in s["receivables"]),
             positions=dict(s["positions"]), marks=dict(s["marks"]),
             mark_wall=s["mark_wall"], peak_nav=s["peak_nav"],
             mandate_version=s["mandate_version"], config_digest=s["config_digest"],
-            working=tuple(WorkingOrder(**o) for o in s["working"]),
+            working=tuple(working),
         )
-        return Ledger(store, st, set(d["spent_nonces"]), set(d["applied_exec_ids"]),
-                      list(d["submit_seq"]), dict(d["reserved"]))
+        return Ledger(store, st, set(d.get("spent_nonces", [])),
+                      set(d.get("applied_exec_ids", [])), list(d.get("submit_seq", [])),
+                      dict(d.get("reserved", {})), dict(d.get("applied_exec_hashes", {})))
 
     def settle(self, today: int) -> None:
-        """Move matured receivables into settled cash. Never before settle day."""
         due = sum(c for d, c in self.state.receivables if d <= today)
-        rest = tuple((d, c) for d, c in self.state.receivables if d > today)
+        self.state.receivables = tuple((d, c) for d, c in self.state.receivables if d > today)
         self.state.cash_settled += due
-        self.state.receivables = rest
 
     def mark_peak(self) -> None:
         self.state.peak_nav = max(self.state.peak_nav, self.state.nav())

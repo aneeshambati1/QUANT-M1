@@ -1,39 +1,32 @@
-from .settlement import SettlementBook, ExchangeCalendar
-calendar = calendar or ExchangeCalendar("XNYS")
-settlement = SettlementBook(calendar, pending=pending_settlements)
+"""M1.2 dependency wiring. Offline / mock only. No live transport, no secrets."""
 from __future__ import annotations
+
 import os
 import threading
-from .core import (
-    Store, EventLog, Ledger, VerifiedState, Clock, ConfigAuthority,
-    ImmutableFloor, Mandate, Operational, Instrument
-)
+
+from .core import (Store, EventLog, Ledger, VerifiedState, Clock, ConfigAuthority,
+                   ImmutableFloor, Mandate, Operational, Instrument)
 from .flags import Flags
 from .venue import MockVenue
 from .authority import Kernel, Gateway
-def build(
-    tmpdir: str,
-    cash: int = 10_000_000,          # keep: settled cash for backward compatibility
-    positions=None,
-    marks=None,
-    cash_unsettled: int = 0,         # ADD
-    pending_settlements=(),          # ADD
-    calendar=None,                   # ADD: exchange calendar
-    as_of=None,                      # ADD: current business date
-    allow_live: bool = False,        # ADD: must default False
-):
-    positions = positions or {"A": 300, "B": 300}
+
+
+def build(tmpdir: str, cash: int = 10_000_000, positions=None, marks=None,
+          *, settle_lag_days: int = 1, m_vertex: int = 6,
+          trade_date: int = 100, mark_wall: int = 1_000_000,
+          allow_live: bool = False):
+    if allow_live:
+        raise ValueError("M1 build() is offline/mock only; live transport is out of scope")
+
+    os.makedirs(tmpdir, exist_ok=True)
+    positions = positions if positions is not None else {"A": 300, "B": 300}
     marks = marks or {"A": 10_000, "B": 10_000, "C": 10_000}
 
     instruments = {
-        "A": Instrument(
-            "A", "PLAIN_ETF", 50_000_000, 10_000,
-            (("ISS1", 6000), ("ISS2", 4000))
-        ),
-        "B": Instrument(
-            "B", "PLAIN_ETF", 50_000_000, 8_000,
-            (("ISS1", 5000), ("ISS3", 5000))
-        ),
+        "A": Instrument("A", "PLAIN_ETF", 50_000_000, 10_000,
+                        (("ISS1", 6000), ("ISS2", 4000))),
+        "B": Instrument("B", "PLAIN_ETF", 50_000_000, 8_000,
+                        (("ISS1", 5000), ("ISS3", 5000))),
         "C": Instrument("C", "PLAIN_ETF", 50_000_000, 9_000, None),
     }
 
@@ -46,33 +39,35 @@ def build(
 
     cfg = ConfigAuthority(
         ImmutableFloor(),
-        Mandate(version=1),
-        Operational()
+        Mandate(version=1, settle_lag_days=settle_lag_days),
+        Operational(m_vertex=m_vertex),
     )
 
     nav = cash + sum(q * marks[s] for s, q in positions.items())
     st = VerifiedState(
-        0, 100, cash, (), dict(positions), dict(marks),
-        1_000_000, (), nav, 1, cfg.mandate.digest()
+        0, trade_date, cash, (), dict(positions), dict(marks),
+        mark_wall, (), nav, 1, cfg.mandate.digest()
     )
 
     ledger = Ledger(Store(os.path.join(tmpdir, "ledger.json")), st)
     log = EventLog(Store(os.path.join(tmpdir, "events.json")))
-    clock = Clock()
+    clock = Clock(seq=0, wall=mark_wall)
     venue = MockVenue(positions=dict(positions), cash=cash)
     flags = Flags()
 
-    # Test-only secret. Never use this key for an external broker connection.
+    # TEST-ONLY KEY. Never use for an external broker connection.
     key = b"m1-test-key"
 
     wd = os.path.join(tmpdir, "STOP_NEW")
+    flags_store = Store(os.path.join(tmpdir, "flags.json"))
     lock = threading.RLock()
 
     kernel = Kernel(key, cfg, instruments, scenarios, lock=lock)
-    gw = Gateway(
-        key, cfg, ledger, log, venue, clock,
-        instruments, scenarios, flags, wd, lock=lock
-    )
+    gw = Gateway(key, cfg, ledger, log, venue, clock, instruments, scenarios,
+                 flags, wd, lock=lock, flags_store=flags_store)
+
+    # Restore durable safety flags if this directory was used before.
+    gw.restore_flags()
 
     ledger.persist()
 
@@ -90,4 +85,5 @@ def build(
         "wd": wd,
         "lock": lock,
         "key": key,
+        "flags_store": flags_store,
     }

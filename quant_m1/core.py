@@ -1,12 +1,41 @@
-"""Core M1.1: integer units, config authority, durable ledger and state."""
+"""Core M1.2: integer units, config authority, durable ledger and state.
+
+M1.2 changes (API-preserving):
+  - FIX: removed stray module-level fields that broke import
+  - FIX: VerifiedState.digest() now includes mark_wall
+  - FIX: EventLog redacts secrets, exposes immutable entries(), verify()
+  - FIX: ConfigAuthority validates ranges and requires attestation
+  - FIX: WorkingOrder validates numeric invariants
+  - ADD: VerifiedState.cash_unsettled property (receivables IS the unsettled bucket)
+  - ADD: Ledger.snapshot() immutable view
+  - ADD: Ledger.record_sell_receivable() T+1 due-date computation
+  - ADD: Ledger.verify_invariants()
+  - ADD: EventLog.append returns hash unchanged; settle() returns released amount
+
+NOTE: receivables is the SINGLE source of truth for unsettled money.
+      Do not add a parallel cash_unsettled field.
+"""
 from __future__ import annotations
-import hashlib, hmac, json, os, tempfile
+
+import copy
+import hashlib
+import hmac
+import json
+import os
+import tempfile
 from dataclasses import dataclass, field, asdict
+from types import MappingProxyType
 from typing import Any
 
 Money = int  # cents
 Shares = int
 BPS = 10_000
+
+_SECRET_KEYS = frozenset({
+    "key", "secret", "token", "password", "api_key", "apikey",
+    "private_key", "secret_key", "access_token", "refresh_token",
+    "signing_key", "hmac_key",
+})
 
 
 def ceil_bps(amount: int, bps: int) -> int:
@@ -27,6 +56,18 @@ def canonical(obj: Any) -> str:
 
 def sha(obj: Any) -> str:
     return hashlib.sha256(canonical(obj).encode()).hexdigest()
+
+
+def redact(obj: Any) -> Any:
+    """Recursively redact secret-like keys. Never log credentials."""
+    if isinstance(obj, dict):
+        return {
+            k: ("[REDACTED]" if str(k).lower() in _SECRET_KEYS else redact(v))
+            for k, v in obj.items()
+        }
+    if isinstance(obj, (list, tuple)):
+        return [redact(x) for x in obj]
+    return obj
 
 
 @dataclass(frozen=True)
@@ -64,6 +105,30 @@ class Mandate:
     allowlist: frozenset[str] = frozenset({"A", "B", "C"})
     product_classes: frozenset[str] = frozenset({"PLAIN_ETF"})
 
+    def __post_init__(self) -> None:
+        for name in (
+            "gross_bps", "issuer_bps", "factor_bps", "worst_loss_bps",
+            "cvar_bps", "cvar_q_bps", "drawdown_trigger_bps", "participation_bps",
+        ):
+            v = getattr(self, name)
+            if not isinstance(v, int) or v < 0 or v > BPS:
+                raise ConfigAuthorityError(f"{name} must be int in [0, {BPS}]")
+        if self.cvar_q_bps < 1:
+            raise ConfigAuthorityError("cvar_q_bps must be >= 1")
+        if self.settle_lag_days < 1:
+            raise ConfigAuthorityError(
+                "settle_lag_days must be >= 1; T+0 would invalidate "
+                "the reachable-fill risk model (sells must not settle in-window)"
+            )
+        if self.order_notional_cap <= 0:
+            raise ConfigAuthorityError("order_notional_cap must be positive")
+        if self.rate_limit < 1 or self.rate_window < 1:
+            raise ConfigAuthorityError("rate_limit and rate_window must be >= 1")
+        if self.tau_data_secs < 1:
+            raise ConfigAuthorityError("tau_data_secs must be >= 1")
+        if self.version < 1:
+            raise ConfigAuthorityError("version must be >= 1")
+
     def digest(self) -> str:
         d = asdict(self)
         d["allowlist"] = sorted(self.allowlist)
@@ -76,6 +141,14 @@ class Operational:
     m_vertex: int = 6
     auth_ttl_seqs: int = 50
     version: int = 1
+
+    def __post_init__(self) -> None:
+        if not 0 <= self.m_vertex <= 12:
+            raise ConfigAuthorityError("m_vertex must be in [0, 12] (2^m vertex budget)")
+        if self.auth_ttl_seqs < 1:
+            raise ConfigAuthorityError("auth_ttl_seqs must be >= 1")
+        if self.version < 1:
+            raise ConfigAuthorityError("version must be >= 1")
 
     def digest(self) -> str:
         return sha(asdict(self))
@@ -96,18 +169,24 @@ class ConfigAuthority:
         self._floor_digest = self.floor.digest()
 
     def apply_config(self, diff: dict) -> None:
+        if not self.attested():
+            raise ConfigAuthorityError("CONFIG rejected: immutable floor unattested")
         illegal = IMMUTABLE_FIELDS & set(diff)
         if illegal:
             raise ConfigAuthorityError(f"CONFIG attempted immutable change: {sorted(illegal)}")
         if "mandate" in diff:
             md = dict(diff["mandate"])
             md["allowlist"] = frozenset(md.get("allowlist", self.mandate.allowlist))
-            md["product_classes"] = frozenset(md.get("product_classes", self.mandate.product_classes))
+            md["product_classes"] = frozenset(
+                md.get("product_classes", self.mandate.product_classes)
+            )
             self.mandate = Mandate(**{**asdict(self.mandate), **md,
                                       "version": self.mandate.version + 1})
         if "ops" in diff:
             self.ops = Operational(**{**asdict(self.ops), **diff["ops"],
                                       "version": self.ops.version + 1})
+        if not self.attested():
+            raise ConfigAuthorityError("CONFIG corrupted immutable floor")
 
     def attested(self) -> bool:
         return hmac.compare_digest(self.floor.digest(), self._floor_digest)
@@ -152,11 +231,12 @@ class Store:
                 f.flush()
                 os.fsync(f.fileno())
             os.replace(tmp, self.path)
-            # Persist directory entry where supported.
             try:
                 dfd = os.open(d, os.O_DIRECTORY)
-                try: os.fsync(dfd)
-                finally: os.close(dfd)
+                try:
+                    os.fsync(dfd)
+                finally:
+                    os.close(dfd)
             except (AttributeError, OSError):
                 pass
         finally:
@@ -177,7 +257,7 @@ class EventLog:
 
     def append(self, kind: str, payload: dict, seq: int) -> str:
         prev = self.chain[-1]["hash"] if self.chain else "0" * 64
-        rec = {"seq": seq, "kind": kind, "payload": payload, "prev": prev}
+        rec = {"seq": seq, "kind": kind, "payload": redact(payload), "prev": prev}
         rec["hash"] = hashlib.sha256((prev + canonical(rec)).encode()).hexdigest()
         self.chain.append(rec)
         self.store.save(self.chain)
@@ -185,6 +265,20 @@ class EventLog:
 
     def head(self) -> str:
         return self.chain[-1]["hash"] if self.chain else "0" * 64
+
+    def entries(self) -> tuple[dict, ...]:
+        """Immutable deep-copied view. Cannot be used to bypass the hash chain."""
+        return tuple(copy.deepcopy(self.chain))
+
+    def verify(self) -> bool:
+        prev = "0" * 64
+        for rec in self.chain:
+            body = {k: v for k, v in rec.items() if k != "hash"}
+            expected = hashlib.sha256((prev + canonical(body)).encode()).hexdigest()
+            if rec.get("prev") != prev or rec.get("hash") != expected:
+                return False
+            prev = rec["hash"]
+        return True
 
     def restore(self) -> None:
         data = self.store.load()
@@ -232,6 +326,16 @@ class WorkingOrder:
     filled_notional: Money = 0
     filled_cost: Money = 0
 
+    def __post_init__(self) -> None:
+        if self.side not in {"BUY", "SELL"}:
+            raise ValueError(f"invalid side: {self.side}")
+        if self.cum_filled < 0 or self.qty < 0 or self.cum_filled > self.qty:
+            raise ValueError("require 0 <= cum_filled <= qty")
+        if self.price < 0 or self.cost_bps < 0:
+            raise ValueError("price and cost_bps must be nonnegative")
+        if self.filled_notional < 0 or self.filled_cost < 0:
+            raise ValueError("filled_notional and filled_cost must be nonnegative")
+
     @property
     def remaining(self) -> Shares:
         return self.qty - self.cum_filled
@@ -246,8 +350,6 @@ class VerifiedState:
     seq: int
     trade_date: int
     cash_settled: Money
-cash_unsettled: int
-pending_settlements: tuple[PendingSettlement, ...]
     receivables: tuple[tuple[int, Money], ...]
     positions: dict[str, Shares]
     marks: dict[str, Money]
@@ -260,6 +362,11 @@ pending_settlements: tuple[PendingSettlement, ...]
     def receivable_total(self) -> Money:
         return sum(c for _, c in self.receivables)
 
+    @property
+    def cash_unsettled(self) -> Money:
+        """Read-only alias. receivables IS the unsettled bucket (T+1)."""
+        return self.receivable_total()
+
     def nav(self) -> Money:
         if any(s not in self.marks for s, q in self.positions.items() if q):
             raise ValueError("position has no current mark")
@@ -270,10 +377,35 @@ pending_settlements: tuple[PendingSettlement, ...]
         return sha({
             "seq": self.seq, "date": self.trade_date, "cash": self.cash_settled,
             "recv": sorted(self.receivables), "pos": self.positions,
-            "marks": self.marks, "peak": self.peak_nav,
+            "marks": self.marks, "mark_wall": self.mark_wall,
+            "peak": self.peak_nav,
             "working": [asdict(o) for o in self.working],
             "mv": self.mandate_version, "cd": self.config_digest,
         })
+
+
+@dataclass(frozen=True)
+class LedgerSnapshot:
+    """Immutable, deep-copied view. Mutating it cannot affect the Ledger."""
+    seq: int
+    trade_date: int
+    cash_settled: Money
+    cash_unsettled: Money
+    receivables: tuple[tuple[int, Money], ...]
+    positions: Any
+    marks: Any
+    mark_wall: int
+    working: tuple[WorkingOrder, ...]
+    peak_nav: Money
+    nav: Money
+    mandate_version: int
+    config_digest: str
+    reserved: Any
+    state_digest: str
+
+
+class InvariantError(Exception):
+    pass
 
 
 @dataclass
@@ -311,10 +443,9 @@ class Ledger:
         if d is None:
             return None
         s = d["state"]
-        working = []
-        for item in s["working"]:
-            # Backward compatible with pre-M1.1 ledgers.
-            working.append(WorkingOrder(**item))
+        known = set(WorkingOrder.__dataclass_fields__)
+        working = [WorkingOrder(**{k: v for k, v in item.items() if k in known})
+                   for item in s["working"]]
         st = VerifiedState(
             seq=s["seq"], trade_date=s["trade_date"], cash_settled=s["cash_settled"],
             receivables=tuple(tuple(x) for x in s["receivables"]),
@@ -327,10 +458,48 @@ class Ledger:
                       set(d.get("applied_exec_ids", [])), list(d.get("submit_seq", [])),
                       dict(d.get("reserved", {})), dict(d.get("applied_exec_hashes", {})))
 
-    def settle(self, today: int) -> None:
+    def snapshot(self) -> LedgerSnapshot:
+        return LedgerSnapshot(
+            seq=self.state.seq,
+            trade_date=self.state.trade_date,
+            cash_settled=self.state.cash_settled,
+            cash_unsettled=self.state.receivable_total(),
+            receivables=tuple(self.state.receivables),
+            positions=MappingProxyType(dict(self.state.positions)),
+            marks=MappingProxyType(dict(self.state.marks)),
+            mark_wall=self.state.mark_wall,
+            working=tuple(copy.deepcopy(list(self.state.working))),
+            peak_nav=self.state.peak_nav,
+            nav=self.state.nav(),
+            mandate_version=self.state.mandate_version,
+            config_digest=self.state.config_digest,
+            reserved=MappingProxyType(dict(self.reserved)),
+            state_digest=self.state.digest(),
+        )
+
+    def record_sell_receivable(
+        self, trade_date: int, amount: Money, settle_lag_days: int
+    ) -> int:
+        """Book net sell proceeds as unsettled. Returns due session index.
+
+        Sells must NEVER increase cash_settled in-window.
+        """
+        if settle_lag_days < 1:
+            raise ValueError("settle_lag_days must be >= 1 (T+1 or later)")
+        if amount <= 0:
+            raise ValueError("receivable amount must be positive")
+        due = trade_date + settle_lag_days
+        self.state.receivables = self.state.receivables + ((due, amount),)
+        return due
+
+    def settle(self, today: int) -> Money:
+        """Release matured receivables. Returns amount released."""
         due = sum(c for d, c in self.state.receivables if d <= today)
-        self.state.receivables = tuple((d, c) for d, c in self.state.receivables if d > today)
+        self.state.receivables = tuple(
+            (d, c) for d, c in self.state.receivables if d > today
+        )
         self.state.cash_settled += due
+        return due
 
     def mark_peak(self) -> None:
         self.state.peak_nav = max(self.state.peak_nav, self.state.nav())
@@ -343,3 +512,21 @@ class Ledger:
 
     def working_active(self) -> tuple[WorkingOrder, ...]:
         return tuple(o for o in self.state.working if not o.terminal and o.remaining > 0)
+
+    def verify_invariants(self) -> None:
+        s = self.state
+        if s.cash_settled < 0:
+            raise InvariantError("SETTLED_CASH_NEGATIVE")
+        if s.receivable_total() < 0:
+            raise InvariantError("RECEIVABLE_NEGATIVE")
+        if any(q < 0 for q in s.positions.values()):
+            raise InvariantError("SHORT_POSITION")
+        if any(c <= 0 for _, c in s.receivables):
+            raise InvariantError("NONPOSITIVE_RECEIVABLE")
+        if any(d <= s.trade_date - 1 for d, _ in s.receivables):
+            raise InvariantError("STALE_UNSETTLED_RECEIVABLE")
+        for o in s.working:
+            if o.cum_filled > o.qty:
+                raise InvariantError("OVERFILLED_WORKING_ORDER")
+        if any(s.marks.get(sym) is None for sym, q in s.positions.items() if q):
+            raise InvariantError("MISSING_MARK")

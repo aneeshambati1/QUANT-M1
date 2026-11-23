@@ -1,12 +1,4 @@
-"""M1.2 permission flags.
-
-M1.2 changes (API-preserving, additive only):
-  - ADD: killed / frozen fields (default False) at END of field list
-  - killed  -> ALL permissions removed (hard stop)
-  - frozen  -> NEW_RISK and SUBMIT removed
-  - DOCUMENTED: market == "STRESS" is intentionally permissive; stress is
-    handled through risk scenarios, not permissions. Change only with a test.
-"""
+"""M1.3 permission flags. killed/frozen are additive and default False."""
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -16,14 +8,14 @@ PERMS = ("NEW_RISK", "REDUCE_RISK", "SUBMIT", "RECOVER_AUTO")
 
 @dataclass
 class Flags:
-    data: str = "OK"          # OK|DEGRADED|STALE|CONFLICTED
-    model: str = "OK"         # OK|OOD|INADEQUATE|SUPPORT_EXIT
-    exec: str = "OK"          # OK|DEGRADED|DIVERGENT|DISCONNECTED
-    envelope: str = "OK"      # OK|CONTRACTED|EMPTY|OVERFLOW
-    governance: str = "OK"    # OK|UNATTESTED|ROLLBACK_REQUIRED
-    market: str = "NORMAL"    # NORMAL|STRESS|RESTRICTED
-    killed: bool = False      # hard stop: no permissions at all
-    frozen: bool = False      # no new risk, no submission
+    data: str = "OK"
+    model: str = "OK"
+    exec: str = "OK"
+    envelope: str = "OK"
+    governance: str = "OK"
+    market: str = "NORMAL"
+    killed: bool = False
+    frozen: bool = False
 
     def permissions(self) -> frozenset[str]:
         if self.killed:
@@ -49,7 +41,7 @@ class Flags:
 @dataclass(frozen=True)
 class Monitor:
     name: str
-    data: str            # INDEPENDENT | SHARED:<x> | UNKNOWN
+    data: str
     compute: str
     config: str
     clock: str

@@ -1,3 +1,6 @@
+from .settlement import SettlementBook, ExchangeCalendar
+calendar = calendar or ExchangeCalendar("XNYS")
+settlement = SettlementBook(calendar, pending=pending_settlements)
 from __future__ import annotations
 import os
 import threading

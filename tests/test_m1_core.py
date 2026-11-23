@@ -1,26 +1,19 @@
-"""M1.2 core/venue/risk/flags/reference acceptance tests.
-
-Runs WITHOUT authority.py. Proves the invariants that were previously untested.
-
-    python -m pytest tests/test_m1_core.py -q
-"""
+"""M1 core/venue/risk/flags/reference acceptance tests. No authority dependency."""
 from __future__ import annotations
 
-from dataclasses import replace
 from fractions import Fraction
 
 import pytest
 
 from quant_m1.core import (
-    BPS, Clock, ConfigAuthority, ConfigAuthorityError, EventLog, ImmutableFloor,
+    BPS, ConfigAuthority, ConfigAuthorityError, EventLog, ImmutableFloor,
     InvariantError, Instrument, Ledger, Mandate, Operational, Store, VerifiedState,
     WorkingOrder, ceil_bps,
 )
 from quant_m1.flags import Flags, Monitor, may_auto_recover
-from quant_m1.reference import (
-    ref_gross, ref_gross_abs, ref_receivable, ref_settled, ref_settled_ceil,
-)
-from quant_m1.risk import evaluate, reservations, simulate
+from quant_m1.reference import (ref_gross, ref_gross_abs, ref_receivable,
+                                ref_settled, ref_settled_ceil)
+from quant_m1.risk import evaluate, is_risk_reducing, reservations, simulate
 from quant_m1.venue import MockVenue
 
 
@@ -39,28 +32,24 @@ def _ledger(tmp_path, cash=10_000_000, positions=None, marks=None):
     marks = marks or {"A": 10_000, "B": 10_000, "C": 10_000}
     cfg = ConfigAuthority(ImmutableFloor(), Mandate(version=1), Operational())
     nav = cash + sum(q * marks[s] for s, q in positions.items())
-    st = VerifiedState(
-        0, 100, cash, (), dict(positions), dict(marks),
-        1_000_000, (), nav, 1, cfg.mandate.digest(),
-    )
+    st = VerifiedState(0, 100, cash, (), dict(positions), dict(marks),
+                       1_000_000, (), nav, 1, cfg.mandate.digest())
     return Ledger(Store(str(tmp_path / "ledger.json")), st), cfg, marks
 
 
 def _scenarios(marks):
-    return (
-        {s: int(m * 0.90) for s, m in marks.items()},
-        {s: int(m * 0.95) for s, m in marks.items()},
-        {s: int(m * 1.02) for s, m in marks.items()},
-        {s: int(m * 1.05) for s, m in marks.items()},
-    )
+    return ({s: int(m * 0.90) for s, m in marks.items()},
+            {s: int(m * 0.95) for s, m in marks.items()},
+            {s: int(m * 1.02) for s, m in marks.items()},
+            {s: int(m * 1.05) for s, m in marks.items()})
 
 
-# ---------------- T+1: the invariant that was never tested ----------------
+# ---------------- T+1 ----------------
 
 def test_sell_receivable_never_touches_settled_cash(tmp_path):
     led, _, _ = _ledger(tmp_path, cash=0, positions={"A": 10})
     before = led.state.cash_settled
-    due = led.record_sell_receivable(trade_date=100, amount=100_000, settle_lag_days=1)
+    due = led.record_sell_receivable(100, 100_000, 1)
     assert due == 101
     assert led.state.cash_settled == before == 0
     assert led.state.cash_unsettled == 100_000
@@ -81,7 +70,15 @@ def test_settle_next_session_releases(tmp_path):
     assert led.settle(101) == 100_000
     assert led.state.cash_settled == 100_000
     assert led.state.cash_unsettled == 0
-    assert led.settle(101) == 0  # idempotent
+    assert led.settle(101) == 0
+
+
+def test_settlement_session_cannot_regress(tmp_path):
+    led, _, _ = _ledger(tmp_path, cash=0, positions={"A": 10})
+    led.record_sell_receivable(100, 100_000, 1)
+    led.settle(101)
+    with pytest.raises(ValueError, match="REGRESSION"):
+        led.settle(100)
 
 
 def test_settle_lag_zero_rejected(tmp_path):
@@ -93,7 +90,7 @@ def test_settle_lag_zero_rejected(tmp_path):
 
 
 def test_simulate_sell_adds_receivable_not_cash(tmp_path):
-    led, cfg, marks = _ledger(tmp_path, cash=0, positions={"A": 10})
+    led, cfg, _ = _ledger(tmp_path, cash=0, positions={"A": 10})
     o = WorkingOrder("o1", "A", "SELL", 10, 0, 10_000, 25, "RESERVED", 100, "n")
     sim = simulate(led.state, (o,), (1,), 1, _instruments(), cfg.mandate.settle_lag_days)
     assert sim.cash_settled == 0
@@ -108,10 +105,43 @@ def test_simulate_rejects_t0_settle_lag(tmp_path):
 
 
 def test_reference_agrees_sells_never_settle(tmp_path):
-    led, _, _ = _ledger(tmp_path, cash=0, positions={"A": 10})
     o = WorkingOrder("o1", "A", "SELL", 10, 0, 10_000, 25, "RESERVED", 100, "n")
     assert ref_settled(0, (o,), (1,)) == Fraction(0)
     assert ref_receivable(0, (o,), (1,)) > 0
+
+
+# ---------------- risk-reducing exemption ----------------
+
+def test_risk_reducing_sell_allowed_from_breached_book(tmp_path):
+    led, cfg, marks = _ledger(tmp_path, cash=0, positions={"A": 10})
+    o = WorkingOrder("o1", "A", "SELL", 10, 0, 10_000, 0, "RESERVED", 100, "n")
+    ev = evaluate(led.state, (o,), _instruments(), cfg.mandate, _scenarios(marks))
+    assert ev.ok, ev.reason
+    assert ev.risk_reducing
+
+
+def test_hard_floor_not_exempted_even_when_reducing(tmp_path):
+    led, cfg, marks = _ledger(tmp_path, cash=0, positions={"A": 10})
+    buy = WorkingOrder("b1", "C", "BUY", 10, 0, 10_000, 0, "RESERVED", 100, "n")
+    ev = evaluate(led.state, (buy,), _instruments(), cfg.mandate, _scenarios(marks))
+    assert not ev.ok
+    assert ev.reason == "SETTLED_CASH_NEGATIVE"
+
+
+def test_loss_floor_makes_gain_to_zero_non_increasing():
+    base = {"gross": 100, "issuer_max": 60, "factor_abs": 100,
+            "worst_loss": 10, "cvar": -5, "neg_cash": 0}
+    worst = {"gross": 100, "issuer_max": 60, "factor_abs": 100,
+             "worst_loss": 10, "cvar": 0, "neg_cash": 0}
+    assert is_risk_reducing(worst, base)
+
+
+def test_genuine_increase_still_detected():
+    base = {"gross": 100, "issuer_max": 60, "factor_abs": 100,
+            "worst_loss": 10, "cvar": 5, "neg_cash": 0}
+    worst = {"gross": 200, "issuer_max": 60, "factor_abs": 100,
+             "worst_loss": 10, "cvar": 5, "neg_cash": 0}
+    assert not is_risk_reducing(worst, base)
 
 
 # ---------------- immutability / audit ----------------
@@ -149,8 +179,19 @@ def test_event_log_tamper_detected(tmp_path):
     assert log.verify()
     log.chain[0]["payload"]["x"] = 999
     assert not log.verify()
+
+
+def test_event_log_restore_rejects_on_disk_tamper(tmp_path):
+    store = Store(str(tmp_path / "events.json"))
+    log = EventLog(store)
+    log.append("A", {"x": 1}, 1)
+    log.append("B", {"y": 2}, 2)
+    disk = store.load()
+    disk[0]["payload"]["x"] = 999
+    store.save(disk)
+    log2 = EventLog(store)
     with pytest.raises(ValueError):
-        log.restore()
+        log2.restore()
 
 
 def test_event_log_entries_immutable(tmp_path):
@@ -193,14 +234,12 @@ def test_unattested_config_rejected():
         cfg.apply_config({"mandate": {"gross_bps": 9_000}})
 
 
-# ---------------- risk config honoring ----------------
+# ---------------- risk config ----------------
 
 def test_evaluate_honors_m_vertex(tmp_path):
     led, cfg, marks = _ledger(tmp_path)
-    orders = tuple(
-        WorkingOrder(f"o{i}", "C", "BUY", 1, 0, 10_000, 10, "RESERVED", 100, f"n{i}")
-        for i in range(3)
-    )
+    orders = tuple(WorkingOrder(f"o{i}", "C", "BUY", 1, 0, 10_000, 10,
+                                "RESERVED", 100, f"n{i}") for i in range(3))
     sc = _scenarios(marks)
     assert evaluate(led.state, orders, _instruments(), cfg.mandate, sc,
                     m_vertex=2).reason == "M_VERTEX_EXCEEDED"
@@ -209,7 +248,7 @@ def test_evaluate_honors_m_vertex(tmp_path):
 
 
 def test_reservations_refuse_failed_evaluation(tmp_path):
-    led, cfg, marks = _ledger(tmp_path)
+    led, cfg, _ = _ledger(tmp_path)
     ev = evaluate(led.state, (), _instruments(), cfg.mandate, ())
     assert not ev.ok
     with pytest.raises(ValueError):
@@ -249,7 +288,7 @@ def test_venue_cash_is_t0_and_declared():
     v = MockVenue(positions={"A": 10}, cash=0)
     v.send("o1", "A", "SELL", 10, 10_000, 0)
     v.fill("o1", 10, 10_000)
-    assert v.cash == 100_000            # venue settles immediately
+    assert v.cash == 100_000
     assert v.snapshot()["cash_is_t0"] is True
 
 
@@ -286,7 +325,7 @@ def test_auto_recovery_requires_independence():
     assert not may_auto_recover(ok, Flags(killed=True))
 
 
-# ---------------- reference vs production ----------------
+# ---------------- reference ----------------
 
 def test_gross_signed_equals_abs_under_long_only(tmp_path):
     led, _, _ = _ledger(tmp_path)
@@ -302,7 +341,7 @@ def test_production_cost_is_conservative_vs_exact(tmp_path):
     assert prod <= exact
 
 
-# ---------------- working order validation ----------------
+# ---------------- validation / persistence ----------------
 
 def test_overfilled_working_order_rejected():
     with pytest.raises(ValueError):
@@ -313,8 +352,6 @@ def test_invalid_side_rejected():
     with pytest.raises(ValueError):
         WorkingOrder("o", "A", "SHORT", 5, 0, 10_000, 0, "RESERVED", 100, "n")
 
-
-# ---------------- persistence round trip ----------------
 
 def test_persist_restore_preserves_receivables(tmp_path):
     led, _, _ = _ledger(tmp_path, cash=0, positions={"A": 10})

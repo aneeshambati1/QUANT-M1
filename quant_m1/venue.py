@@ -1,15 +1,7 @@
-"""Deterministic M1.2 mock venue. No network or real broker access.
+"""Deterministic M1.3 mock venue. No network or real broker access.
 
-M1.2 changes (API-preserving):
-  - FIX: ExecEvent.seq now monotonically increasing (was always 0)
-  - FIX: cancel_ack no longer relabels REJECTED as CANCELLED
-  - ADD: timeout() -> UNKNOWN state event
-  - ADD: snapshot() declares cash_is_t0 so reconciliation cannot
-         compare venue T+0 cash against ledger T+1 cash_settled alone
-
-RECONCILIATION RULE:
-    venue.cash  ==  ledger.cash_settled + ledger.receivable_total()
-NOT venue.cash  ==  ledger.cash_settled
+Venue cash is T+0. Reconciliation must compare against
+ledger.cash_settled + ledger.receivable_total(), never cash_settled alone.
 """
 from __future__ import annotations
 
@@ -72,7 +64,6 @@ class MockVenue:
 
     def send(self, order_id: str, symbol: str, side: str, qty: Shares,
              price: Money, cost_bps: int = 0) -> None:
-        """Idempotent by client order ID."""
         if not self.present:
             raise ConnectionError("venue unavailable")
         old = self.orders.get(order_id)
@@ -85,8 +76,7 @@ class MockVenue:
         if side not in {"BUY", "SELL"} or qty <= 0 or price <= 0:
             raise ValueError("invalid order")
         self.orders[order_id] = VenueOrder(
-            order_id, symbol, side, qty, 0, price, "ACKNOWLEDGED", 0, 0, cost_bps
-        )
+            order_id, symbol, side, qty, 0, price, "ACKNOWLEDGED", 0, 0, cost_bps)
         self._emit(order_id, "ACK", 0, price)
 
     def fill(self, order_id: str, q: Shares, price: Money | None = None,
@@ -127,7 +117,6 @@ class MockVenue:
         return self._emit(order_id, "REJECT", 0, o.price)
 
     def timeout(self, order_id: str) -> ExecEvent:
-        """Order state becomes UNKNOWN. Gateway must freeze, not infer rejection."""
         o = self.orders[order_id]
         if o.status not in {"FILLED", "CANCELLED", "REJECTED"}:
             o.status = "UNKNOWN"
@@ -140,16 +129,9 @@ class MockVenue:
             "complete": True,
             "cash_is_t0": True,
             "orders": {
-                k: {
-                    "cum_qty": v.cum_qty,
-                    "status": v.status,
-                    "qty": v.qty,
-                    "symbol": v.symbol,
-                    "side": v.side,
-                    "price": v.price,
-                    "filled_notional": v.filled_notional,
-                    "filled_cost": v.filled_cost,
-                }
+                k: {"cum_qty": v.cum_qty, "status": v.status, "qty": v.qty,
+                      "symbol": v.symbol, "side": v.side, "price": v.price,
+                      "filled_notional": v.filled_notional, "filled_cost": v.filled_cost}
                 for k, v in self.orders.items()
             },
             "positions": dict(self.positions),

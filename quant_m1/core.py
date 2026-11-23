@@ -246,6 +246,8 @@ class VerifiedState:
     seq: int
     trade_date: int
     cash_settled: Money
+cash_unsettled: int
+pending_settlements: tuple[PendingSettlement, ...]
     receivables: tuple[tuple[int, Money], ...]
     positions: dict[str, Shares]
     marks: dict[str, Money]

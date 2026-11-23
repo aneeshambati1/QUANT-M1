@@ -1,5 +1,15 @@
+"""M1.2 permission flags.
+
+M1.2 changes (API-preserving, additive only):
+  - ADD: killed / frozen fields (default False) at END of field list
+  - killed  -> ALL permissions removed (hard stop)
+  - frozen  -> NEW_RISK and SUBMIT removed
+  - DOCUMENTED: market == "STRESS" is intentionally permissive; stress is
+    handled through risk scenarios, not permissions. Change only with a test.
+"""
 from __future__ import annotations
-from dataclasses import dataclass, field
+
+from dataclasses import dataclass
 
 PERMS = ("NEW_RISK", "REDUCE_RISK", "SUBMIT", "RECOVER_AUTO")
 
@@ -12,9 +22,15 @@ class Flags:
     envelope: str = "OK"      # OK|CONTRACTED|EMPTY|OVERFLOW
     governance: str = "OK"    # OK|UNATTESTED|ROLLBACK_REQUIRED
     market: str = "NORMAL"    # NORMAL|STRESS|RESTRICTED
+    killed: bool = False      # hard stop: no permissions at all
+    frozen: bool = False      # no new risk, no submission
 
     def permissions(self) -> frozenset[str]:
+        if self.killed:
+            return frozenset()
         p = set(PERMS)
+        if self.frozen:
+            p -= {"NEW_RISK", "SUBMIT"}
         if self.data != "OK":
             p -= {"NEW_RISK"}
         if self.model != "OK":

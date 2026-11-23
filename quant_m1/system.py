@@ -1,4 +1,4 @@
-"""M1.2 dependency wiring. Offline / mock only. No live transport, no secrets."""
+"""M1.3 dependency wiring. Offline / mock only. No live transport, no secrets."""
 from __future__ import annotations
 
 import os
@@ -37,17 +37,13 @@ def build(tmpdir: str, cash: int = 10_000_000, positions=None, marks=None,
         {s: int(m * 1.05) for s, m in marks.items()},
     )
 
-    cfg = ConfigAuthority(
-        ImmutableFloor(),
-        Mandate(version=1, settle_lag_days=settle_lag_days),
-        Operational(m_vertex=m_vertex),
-    )
+    cfg = ConfigAuthority(ImmutableFloor(),
+                          Mandate(version=1, settle_lag_days=settle_lag_days),
+                          Operational(m_vertex=m_vertex))
 
     nav = cash + sum(q * marks[s] for s, q in positions.items())
-    st = VerifiedState(
-        0, trade_date, cash, (), dict(positions), dict(marks),
-        mark_wall, (), nav, 1, cfg.mandate.digest()
-    )
+    st = VerifiedState(0, trade_date, cash, (), dict(positions), dict(marks),
+                       mark_wall, (), nav, 1, cfg.mandate.digest())
 
     ledger = Ledger(Store(os.path.join(tmpdir, "ledger.json")), st)
     log = EventLog(Store(os.path.join(tmpdir, "events.json")))
@@ -65,25 +61,10 @@ def build(tmpdir: str, cash: int = 10_000_000, positions=None, marks=None,
     kernel = Kernel(key, cfg, instruments, scenarios, lock=lock)
     gw = Gateway(key, cfg, ledger, log, venue, clock, instruments, scenarios,
                  flags, wd, lock=lock, flags_store=flags_store)
-
-    # Restore durable safety flags if this directory was used before.
     gw.restore_flags()
-
     ledger.persist()
 
-    return {
-        "cfg": cfg,
-        "ledger": ledger,
-        "log": log,
-        "clock": clock,
-        "venue": venue,
-        "flags": flags,
-        "kernel": kernel,
-        "gw": gw,
-        "instruments": instruments,
-        "scenarios": scenarios,
-        "wd": wd,
-        "lock": lock,
-        "key": key,
-        "flags_store": flags_store,
-    }
+    return {"cfg": cfg, "ledger": ledger, "log": log, "clock": clock, "venue": venue,
+            "flags": flags, "kernel": kernel, "gw": gw, "instruments": instruments,
+            "scenarios": scenarios, "wd": wd, "lock": lock, "key": key,
+            "flags_store": flags_store}

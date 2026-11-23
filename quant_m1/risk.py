@@ -1,11 +1,18 @@
-"""M1.1 deterministic reachable-fill risk evaluation.
+"""M1.2 deterministic reachable-fill risk evaluation.
 
-Each simulated state carries its own mark snapshot. There is no shared
-module-global mark cache.
+Each simulated state carries its own mark snapshot. No shared global mark cache.
+
+M1.2 changes (API-preserving):
+  - FIX: settle_lag is now VALIDATED (>=1). Previously accepted and ignored.
+         T+0 would invalidate the model: sells must not settle in-window.
+  - FIX: evaluate() honors m_vertex instead of hardcoding 6.
+         Default 6 preserves prior behavior; pass ops.m_vertex to configure.
 """
 from __future__ import annotations
+
 import itertools
 from dataclasses import dataclass
+
 from .core import (Money, Shares, BPS, Mandate, Instrument, WorkingOrder,
                    VerifiedState, ceil_bps, floor_bps)
 
@@ -24,6 +31,11 @@ def simulate(base: VerifiedState, orders: tuple[WorkingOrder, ...],
              settle_lag: int) -> SimState:
     if den <= 0 or len(nums) != len(orders) or any(n < 0 or n > den for n in nums):
         raise ValueError("invalid fill-fraction vector")
+    if settle_lag < 1:
+        raise ValueError(
+            "settle_lag must be >= 1: with T+0, sell proceeds would become "
+            "settled cash in-window and this risk model would be invalid"
+        )
     pos = dict(base.positions)
     cash = base.cash_settled
     recv = base.receivable_total()
@@ -42,7 +54,7 @@ def simulate(base: VerifiedState, orders: tuple[WorkingOrder, ...],
             if q > pos.get(o.symbol, 0):
                 raise ValueError("reachable fill creates short position")
             pos[o.symbol] = pos.get(o.symbol, 0) - q
-            recv += notional - cost
+            recv += notional - cost   # T+1: NEVER settled cash in-window
         else:
             raise ValueError("unknown order side")
     if any(s not in base.marks for s, q in pos.items() if q):
@@ -76,6 +88,7 @@ class Usage:
 
 def usage(sim: SimState, base_nav: Money, instruments: dict[str, Instrument],
           scenarios: tuple[dict[str, int], ...], q_bps: int) -> Usage:
+    """Exposure uses ABSOLUTE market value (conservative under any sign)."""
     if not scenarios:
         raise ValueError("at least one stress scenario is required")
     if not 1 <= q_bps <= BPS:
@@ -132,9 +145,10 @@ class Evaluation:
 
 def evaluate(base: VerifiedState, orders: tuple[WorkingOrder, ...],
              instruments: dict[str, Instrument], mandate: Mandate,
-             scenarios: tuple[dict[str, int], ...]) -> Evaluation:
+             scenarios: tuple[dict[str, int], ...],
+             *, m_vertex: int = 6) -> Evaluation:
     m = len(orders)
-    if m > 6:
+    if m > m_vertex:
         return Evaluation(False, "M_VERTEX_EXCEEDED", {}, {}, 0, False, 0)
     if not scenarios:
         return Evaluation(False, "NO_STRESS_SCENARIOS", {}, {}, 0, False, 0)

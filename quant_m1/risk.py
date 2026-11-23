@@ -1,13 +1,4 @@
-"""M1.2 deterministic reachable-fill risk evaluation.
-
-Each simulated state carries its own mark snapshot. No shared global mark cache.
-
-M1.2 changes (API-preserving):
-  - FIX: settle_lag is now VALIDATED (>=1). Previously accepted and ignored.
-         T+0 would invalidate the model: sells must not settle in-window.
-  - FIX: evaluate() honors m_vertex instead of hardcoding 6.
-         Default 6 preserves prior behavior; pass ops.m_vertex to configure.
-"""
+"""M1.3 deterministic reachable-fill risk evaluation. Per-SimState marks."""
 from __future__ import annotations
 
 import itertools
@@ -32,10 +23,7 @@ def simulate(base: VerifiedState, orders: tuple[WorkingOrder, ...],
     if den <= 0 or len(nums) != len(orders) or any(n < 0 or n > den for n in nums):
         raise ValueError("invalid fill-fraction vector")
     if settle_lag < 1:
-        raise ValueError(
-            "settle_lag must be >= 1: with T+0, sell proceeds would become "
-            "settled cash in-window and this risk model would be invalid"
-        )
+        raise ValueError("settle_lag must be >= 1: T+0 would invalidate this model")
     pos = dict(base.positions)
     cash = base.cash_settled
     recv = base.receivable_total()
@@ -54,7 +42,7 @@ def simulate(base: VerifiedState, orders: tuple[WorkingOrder, ...],
             if q > pos.get(o.symbol, 0):
                 raise ValueError("reachable fill creates short position")
             pos[o.symbol] = pos.get(o.symbol, 0) - q
-            recv += notional - cost   # T+1: NEVER settled cash in-window
+            recv += notional - cost
         else:
             raise ValueError("unknown order side")
     if any(s not in base.marks for s, q in pos.items() if q):
@@ -88,7 +76,6 @@ class Usage:
 
 def usage(sim: SimState, base_nav: Money, instruments: dict[str, Instrument],
           scenarios: tuple[dict[str, int], ...], q_bps: int) -> Usage:
-    """Exposure uses ABSOLUTE market value (conservative under any sign)."""
     if not scenarios:
         raise ValueError("at least one stress scenario is required")
     if not 1 <= q_bps <= BPS:
@@ -107,21 +94,12 @@ def usage(sim: SimState, base_nav: Money, instruments: dict[str, Instrument],
         for iss, w in inst.lookthrough():
             issuer[iss] = issuer.get(iss, 0) + ceil_bps(abs(val), w)
         factor += inst.beta_bps * val
-    losses = sorted(
-        (base_nav - scenario_nav(sim, sc) for sc in scenarios),
-        reverse=True
-    )
+    losses = sorted((base_nav - scenario_nav(sim, sc) for sc in scenarios), reverse=True)
     k = max(1, (len(losses) * q_bps + BPS - 1) // BPS)
     k = min(k, len(losses))
     cvar = sum(losses[:k]) // k
-    return Usage(
-        gross,
-        max(issuer.values(), default=0),
-        abs(factor) // BPS,
-        max(losses),
-        cvar,
-        max(0, -sim.cash_settled)
-    )
+    return Usage(gross, max(issuer.values(), default=0), abs(factor) // BPS,
+                 max(losses), cvar, max(0, -sim.cash_settled))
 
 
 def set_marks(_marks: dict[str, Money]) -> None:
@@ -154,9 +132,7 @@ def evaluate(base: VerifiedState, orders: tuple[WorkingOrder, ...],
         return Evaluation(False, "NO_STRESS_SCENARIOS", {}, {}, 0, False, 0)
     try:
         nav0 = base.nav()
-        base_sim = simulate(
-            base, orders, (0,) * m, 1, instruments, mandate.settle_lag_days
-        )
+        base_sim = simulate(base, orders, (0,) * m, 1, instruments, mandate.settle_lag_days)
         bu = usage(base_sim, nav0, instruments, scenarios, mandate.cvar_q_bps)
         base_d = {c: getattr(bu, c) for c in CONSTRAINTS}
         max_d = {c: -10**30 for c in CONSTRAINTS}
@@ -164,9 +140,7 @@ def evaluate(base: VerifiedState, orders: tuple[WorkingOrder, ...],
         n = 0
         for v in vertices(m):
             n += 1
-            sim = simulate(
-                base, orders, v, 1, instruments, mandate.settle_lag_days
-            )
+            sim = simulate(base, orders, v, 1, instruments, mandate.settle_lag_days)
             if any(q < 0 for q in sim.positions.values()):
                 return Evaluation(False, "SHORT_REACHABLE", {}, {}, 0, False, n)
             if sim.cash_settled < 0:
@@ -190,15 +164,10 @@ def evaluate(base: VerifiedState, orders: tuple[WorkingOrder, ...],
         reducing = all(max_d[c] <= base_d[c] for c in CONSTRAINTS)
         return Evaluation(True, "OK", max_d, base_d, nav_min, reducing, n)
     except (ValueError, KeyError, ZeroDivisionError) as exc:
-        return Evaluation(
-            False, f"INVALID_RISK_INPUT:{type(exc).__name__}", {}, {}, 0, False, 0
-        )
+        return Evaluation(False, f"INVALID_RISK_INPUT:{type(exc).__name__}", {}, {}, 0, False, 0)
 
 
 def reservations(ev: Evaluation) -> dict[str, int]:
     if not ev.ok:
         raise ValueError("cannot reserve against a failed risk evaluation")
-    return {
-        c: max(0, ev.max_usage[c] - ev.base_usage[c])
-        for c in CONSTRAINTS
-    }
+    return {c: max(0, ev.max_usage[c] - ev.base_usage[c]) for c in CONSTRAINTS}

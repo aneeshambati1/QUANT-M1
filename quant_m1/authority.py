@@ -1,23 +1,14 @@
-"""M1.2 authorization kernel and execution gateway.
+"""M1.3 authorization kernel and execution gateway.
 
-Safety rules (unchanged):
+Safety rules:
 - one shared lock serializes authorization, submission, events and recovery;
-- every order is bound to an immutable intent and ledger snapshot;
+- every order is bound to an immutable intent, ledger snapshot AND configuration;
 - nonce is durably consumed before transmission;
 - ambiguous broker state never releases a reservation;
-- fills use execution prices, not the order limit price;
-- cancellation/rejection is terminal only after broker snapshot confirmation.
-
-M1.2 fixes:
-  A1 reconciliation compares venue T+0 cash against settled + receivables
-  A2 RESERVED / EXPIRED orders are ledger-only and excluded from venue reconciliation
-  A3 every mutating path persists the ledger and records the exec_id
-  A4 fill accounting is snapshot-authoritative (notional, not last-fill price)
-  A5 receivable due date uses the CURRENT session, not the reservation date
-  A6 m_vertex is passed from cfg.ops into risk.evaluate
-  A7 a BUY fill that drives settled cash negative is applied then flagged DIVERGENT
-  A8 Flags are persisted and can be restored
-  A9 TIMEOUT handled explicitly as an unresolved, non-terminal state
+- fills use venue-authoritative notional, not the order limit price;
+- cancellation/rejection is terminal only after broker snapshot confirmation;
+- reconciliation failure is never reported as APPLIED;
+- a latched divergence is never cleared automatically.
 """
 from __future__ import annotations
 
@@ -34,7 +25,6 @@ from .flags import Flags
 from .risk import evaluate, reservations, CONSTRAINTS
 from .venue import MockVenue, ExecEvent
 
-# Ledger-only statuses: never transmitted, therefore absent from venue snapshots.
 LEDGER_ONLY = frozenset({"RESERVED", "EXPIRED"})
 TERMINAL_VENUE = frozenset({"CANCELLED", "REJECTED", "FILLED"})
 KNOWN_KINDS = frozenset({"ACK", "FILL", "CANCEL_ACK", "CANCEL_REJECT", "REJECT", "TIMEOUT"})
@@ -54,6 +44,8 @@ class Token:
     issue_seq: int
     valid_until_seq: int
     nonce: str
+    mandate_version: int
+    config_digest: str
     sig: str
 
     def body(self) -> dict:
@@ -148,7 +140,6 @@ class Kernel:
                                 intent.price, intent.cost_bps, "RESERVED",
                                 ledger.state.trade_date, nonce)
             orders = active + (cand,)
-            # A6: honor configured vertex budget, not risk.py's default.
             ev = evaluate(ledger.state, orders, self.instruments, cfg.mandate,
                           self.scenarios, m_vertex=cfg.ops.m_vertex)
             if not ev.ok:
@@ -161,8 +152,17 @@ class Kernel:
                 ledger.state.working = ledger.state.working + (cand,)
                 ledger.reserved = reservations(ev)
                 ledger.state.seq = clock.next()
-                tok0 = Token(intent.hash(), ledger.state.digest(), oid, clock.seq,
-                             clock.seq + cfg.ops.auth_ttl_seqs, nonce, "")
+                tok0 = Token(
+                    intent_hash=intent.hash(),
+                    state_hash=ledger.state.digest(),
+                    order_id=oid,
+                    issue_seq=clock.seq,
+                    valid_until_seq=clock.seq + cfg.ops.auth_ttl_seqs,
+                    nonce=nonce,
+                    mandate_version=cfg.mandate.version,
+                    config_digest=cfg.mandate.digest(),
+                    sig="",
+                )
                 tok = Token(**{**asdict(tok0), "sig": sign(self.key, tok0.body())})
                 ledger.persist()
                 return tok
@@ -183,26 +183,45 @@ class Gateway:
         self.scenarios, self.flags, self.watchdog_path = scenarios, flags, watchdog_path
         self.fail_point: str | None = None
         self.lock = lock or threading.RLock()
-        # A8: flags are durable. Default path sits beside the watchdog file.
         self.flags_store = flags_store or Store(
-            os.path.join(os.path.dirname(watchdog_path) or ".", "flags.json")
-        )
+            os.path.join(os.path.dirname(watchdog_path) or ".", "flags.json"))
+        self._divergence_latched = False
 
-    # ---------------- persistence helpers ----------------
+    # ---- durable composite write: ledger + flags in ONE atomic file ----
 
     def _persist(self) -> None:
         self.ledger.persist()
-        self.flags_store.save(asdict(self.flags))
+        self.flags_store.save({
+            "flags": asdict(self.flags),
+            "divergence_latched": self._divergence_latched,
+            "ledger_digest": self.ledger.state.digest(),
+            "audit_head": self.log.head(),
+        })
 
     def restore_flags(self) -> bool:
         d = self.flags_store.load()
         if not d:
             return False
+        payload = d.get("flags", d)
         known = set(Flags.__dataclass_fields__)
-        for k, v in d.items():
+        for k, v in payload.items():
             if k in known:
                 setattr(self.flags, k, v)
+        self._divergence_latched = bool(d.get("divergence_latched", False))
+        if d.get("ledger_digest") and d["ledger_digest"] != self.ledger.state.digest():
+            self.latch_divergence("FLAGS_LEDGER_DIGEST_MISMATCH")
         return True
+
+    def latch_divergence(self, reason: str) -> None:
+        self._divergence_latched = True
+        self.flags.exec = "DIVERGENT"
+        self.log.append("DIVERGENCE_LATCHED", {"reason": reason}, self.clock.next())
+
+    def clear_divergence(self, operator_reason: str) -> None:
+        self._divergence_latched = False
+        self.flags.exec = "OK"
+        self.log.append("DIVERGENCE_CLEARED", {"reason": operator_reason}, self.clock.next())
+        self._persist()
 
     def _watchdog(self) -> bool:
         return os.path.exists(self.watchdog_path)
@@ -223,8 +242,6 @@ class Gateway:
             raise Reject("UNKNOWN_ORDER")
         self.ledger.state.working = tuple(updated)
 
-    # ---------------- submission ----------------
-
     def submit(self, tok: Token, intent: Intent) -> None:
         with self.lock:
             intent.validate()
@@ -236,6 +253,15 @@ class Gateway:
                 raise Reject("BAD_SIGNATURE")
             if tok.intent_hash != intent.hash():
                 raise Reject("INTENT_MUTATED")
+            if not self.cfg.attested():
+                raise Reject("CONFIG_UNATTESTED")
+            if (tok.mandate_version != self.cfg.mandate.version or
+                    tok.config_digest != self.cfg.mandate.digest()):
+                self._expire(tok)
+                raise Reject("TOKEN_CONFIG_STALE")
+            if (self.ledger.state.mandate_version != self.cfg.mandate.version or
+                    self.ledger.state.config_digest != self.cfg.mandate.digest()):
+                raise Reject("CONFIG_STATE_MISMATCH")
             if tok.nonce in self.ledger.spent_nonces:
                 raise Reject("NONCE_REPLAY")
             if not (tok.issue_seq <= self.clock.seq <= tok.valid_until_seq):
@@ -256,7 +282,6 @@ class Gateway:
             if len(recent) >= self.cfg.mandate.rate_limit:
                 raise Reject("RATE_LIMIT")
 
-            # Durably consume the nonce BEFORE transmission.
             self.ledger.spent_nonces.add(tok.nonce)
             self.ledger.submit_seq.append(self.clock.seq)
             self._replace_order(tok.order_id, status="SUBMITTING")
@@ -285,30 +310,27 @@ class Gateway:
             self._recompute()
             self._persist()
 
-    # ---------------- event processing ----------------
-
     def process(self, ev: ExecEvent) -> str:
         with self.lock:
             event_hash = sha(asdict(ev))
             if ev.exec_id in self.ledger.applied_exec_ids:
                 prior = self.ledger.applied_exec_hashes.get(ev.exec_id)
                 if prior is not None and prior != event_hash:
-                    self.flags.exec = "DIVERGENT"
+                    self.latch_divergence("EXEC_ID_PAYLOAD_CONFLICT")
                     self._persist()
                     return "EXEC_ID_PAYLOAD_CONFLICT"
                 return "NOOP_DUPLICATE"
 
             o = self._find(ev.order_id)
             if o is None:
-                self.flags.exec = "DIVERGENT"
+                self.latch_divergence("UNKNOWN_ORDER")
                 self._persist()
                 return "UNKNOWN_ORDER_BLOCKED"
             if ev.kind not in KNOWN_KINDS:
-                self.flags.exec = "DIVERGENT"
+                self.latch_divergence("UNKNOWN_EVENT_KIND")
                 self._persist()
                 return "UNKNOWN_EVENT_BLOCKED"
 
-            # A9: timeout is unresolved, never terminal, never releases reservation.
             if ev.kind == "TIMEOUT":
                 self.flags.exec = "DISCONNECTED"
                 if not o.terminal:
@@ -321,7 +343,7 @@ class Gateway:
 
             if ev.kind == "FILL":
                 if ev.cum_qty > o.qty or ev.price <= 0:
-                    self.flags.exec = "DIVERGENT"
+                    self.latch_divergence("INVALID_FILL")
                     self._persist()
                     return "INVALID_FILL_BLOCKED"
                 snap = self.venue.snapshot()
@@ -331,12 +353,11 @@ class Gateway:
                     return "FILL_UNCONFIRMED_RESERVED"
                 vo = snap["orders"].get(ev.order_id)
                 if vo is None:
-                    self.flags.exec = "DIVERGENT"
+                    self.latch_divergence("FILL_WITHOUT_VENUE_ORDER")
                     self._persist()
                     return "FILL_UNCONFIRMED_RESERVED"
-                # A4: the venue snapshot is authoritative for notional and cost.
                 if vo["cum_qty"] < o.cum_filled or vo["cum_qty"] > o.qty:
-                    self.flags.exec = "DIVERGENT"
+                    self.latch_divergence("VENUE_CUM_OUT_OF_RANGE")
                     self._persist()
                     return "INVALID_FILL_BLOCKED"
                 if vo["cum_qty"] > o.cum_filled:
@@ -344,17 +365,16 @@ class Gateway:
                     dc = vo["filled_cost"] - o.filled_cost
                     dq = vo["cum_qty"] - o.cum_filled
                     if dn <= 0 or dc < 0 or dn < dq:
-                        self.flags.exec = "DIVERGENT"
+                        self.latch_divergence("INVALID_VENUE_NOTIONAL")
                         self._persist()
                         return "INVALID_FILL_BLOCKED"
                     self._apply_snapshot_fill(ev.order_id, vo["cum_qty"], dn, dc)
                 if ev.cum_qty < o.cum_filled:
-                    # A3: stale-cum event. Reconcile, record, persist.
-                    self._reconcile_snapshot()
+                    reconciled = self._reconcile_snapshot()
                     self._record_exec(ev, event_hash)
                     self._recompute()
                     self._persist()
-                    return "SNAPSHOT_RECONCILED"
+                    return "SNAPSHOT_RECONCILED" if reconciled else "SNAPSHOT_RECONCILED_DIVERGENT"
 
             elif ev.kind == "ACK":
                 if o.status in {"RESERVED", "SUBMITTING", "SUBMITTED"}:
@@ -368,7 +388,7 @@ class Gateway:
                     return "CANCEL_UNCONFIRMED_RESERVED"
                 vo = snap["orders"].get(ev.order_id)
                 if not vo or vo["status"] != "CANCELLED":
-                    self.flags.exec = "DIVERGENT"
+                    self.latch_divergence("CANCEL_UNCONFIRMED")
                     self._persist()
                     return "CANCEL_UNCONFIRMED_RESERVED"
                 if vo["cum_qty"] > o.cum_filled:
@@ -377,7 +397,7 @@ class Gateway:
                     self._apply_snapshot_fill(ev.order_id, vo["cum_qty"], dn, dc)
                 current = self._find(ev.order_id)
                 if vo["cum_qty"] != current.cum_filled:
-                    self.flags.exec = "DIVERGENT"
+                    self.latch_divergence("CANCEL_CUM_MISMATCH")
                     self._persist()
                     return "CANCEL_UNCONFIRMED_RESERVED"
                 self._replace_order(ev.order_id, status="CANCELLED")
@@ -389,29 +409,30 @@ class Gateway:
                 snap = self.venue.snapshot()
                 vo = snap["orders"].get(ev.order_id) if snap else None
                 if not vo or vo["status"] != "REJECTED" or vo["cum_qty"] != 0:
-                    self.flags.exec = "DIVERGENT" if snap else "DISCONNECTED"
+                    if snap:
+                        self.latch_divergence("REJECT_UNCONFIRMED")
+                    else:
+                        self.flags.exec = "DISCONNECTED"
                     self._persist()
                     return "REJECT_UNCONFIRMED_RESERVED"
                 self._replace_order(ev.order_id, status="REJECTED")
 
             self._record_exec(ev, event_hash)
-            self._reconcile_snapshot()
+            reconciled = self._reconcile_snapshot()
             self._recompute()
             self._persist()
             self.log.append("EXEC", {"exec_id": ev.exec_id, "kind": ev.kind,
                                      "order_id": ev.order_id, "cum_qty": ev.cum_qty,
-                                     "price": ev.price}, self.clock.next())
-            return "APPLIED"
+                                     "price": ev.price, "reconciled": reconciled},
+                            self.clock.next())
+            return "APPLIED" if reconciled else "APPLIED_RECONCILE_DIVERGENT"
 
     def _record_exec(self, ev: ExecEvent, event_hash: str) -> None:
         self.ledger.applied_exec_ids.add(ev.exec_id)
         self.ledger.applied_exec_hashes[ev.exec_id] = event_hash
 
-    # ---------------- fill application ----------------
-
     def _apply_snapshot_fill(self, order_id: str, cum: int,
                              delta_notional: int, delta_cost: int) -> None:
-        """Single authoritative fill path. Notional/cost come from the venue."""
         o = self._find(order_id)
         if o is None:
             raise Reject("UNKNOWN_ORDER")
@@ -423,36 +444,27 @@ class Gateway:
             self.ledger.state.positions[o.symbol] = \
                 self.ledger.state.positions.get(o.symbol, 0) + dq
             self.ledger.state.cash_settled -= delta_notional + delta_cost
-            # A7: the fill is real, so apply it — but never leave it unflagged.
             if self.ledger.state.cash_settled < 0:
-                self.flags.exec = "DIVERGENT"
-                self.log.append("SETTLED_CASH_NEGATIVE",
-                                {"order_id": order_id,
-                                 "cash_settled": self.ledger.state.cash_settled},
-                                self.clock.next())
+                self.latch_divergence("SETTLED_CASH_NEGATIVE")
         else:
             have = self.ledger.state.positions.get(o.symbol, 0)
             if dq > have:
-                self.flags.exec = "DIVERGENT"
+                self.latch_divergence("FILL_WOULD_CREATE_SHORT")
                 raise Reject("FILL_WOULD_CREATE_SHORT")
             self.ledger.state.positions[o.symbol] = have - dq
             net = delta_notional - delta_cost
             if net > 0:
-                # A5: settle from the CURRENT session, not the reservation date.
                 self.ledger.record_sell_receivable(
-                    self.ledger.state.trade_date, net, self.cfg.mandate.settle_lag_days
-                )
+                    self.ledger.state.trade_date, net, self.cfg.mandate.settle_lag_days)
 
         self._replace_order(
             order_id, cum_filled=cum,
             status="FILLED" if cum == o.qty else "PARTIALLY_FILLED",
             filled_notional=o.filled_notional + delta_notional,
-            filled_cost=o.filled_cost + delta_cost,
-        )
+            filled_cost=o.filled_cost + delta_cost)
         self.ledger.mark_peak()
 
     def _apply_fill(self, order_id: str, cum: int, incremental_price: int) -> None:
-        """Compatibility wrapper. Derives notional from price only as a fallback."""
         o = self._find(order_id)
         if o is None or cum < o.cum_filled or cum > o.qty:
             raise Reject("INVALID_CUMULATIVE_FILL")
@@ -460,10 +472,7 @@ class Gateway:
         if delta == 0:
             return
         notional = delta * incremental_price
-        self._apply_snapshot_fill(order_id, cum, notional,
-                                  ceil_bps(notional, o.cost_bps))
-
-    # ---------------- reconciliation ----------------
+        self._apply_snapshot_fill(order_id, cum, notional, ceil_bps(notional, o.cost_bps))
 
     def _reconcile_snapshot(self) -> bool:
         snap = self.venue.snapshot()
@@ -471,54 +480,52 @@ class Gateway:
             self.flags.exec = "DISCONNECTED"
             return False
 
-        # A1: venue cash is T+0. Ledger holds unsettled proceeds in receivables.
         ledger_cash_equivalent = (self.ledger.state.cash_settled
                                   + self.ledger.state.receivable_total())
         if snap["positions"] != self.ledger.state.positions or \
                 snap["cash"] != ledger_cash_equivalent:
-            self.flags.exec = "DIVERGENT"
+            self.latch_divergence("CASH_OR_POSITION_MISMATCH")
             return False
 
         for o in self.ledger.state.working:
-            # A2: ledger-only orders were never transmitted.
             if o.status in LEDGER_ONLY:
                 continue
             vo = snap["orders"].get(o.order_id)
             if vo is None:
                 if not o.terminal:
-                    self.flags.exec = "DIVERGENT"
+                    self.latch_divergence("MISSING_VENUE_ORDER")
                     return False
                 continue
             if vo["qty"] != o.qty or vo["symbol"] != o.symbol or vo["side"] != o.side:
-                self.flags.exec = "DIVERGENT"
+                self.latch_divergence("ORDER_TERMS_MISMATCH")
                 return False
             if vo["cum_qty"] < o.cum_filled or vo["cum_qty"] > o.qty:
-                self.flags.exec = "DIVERGENT"
+                self.latch_divergence("VENUE_CUM_OUT_OF_RANGE")
                 return False
             if vo["cum_qty"] > o.cum_filled:
                 dn = vo["filled_notional"] - o.filled_notional
                 dc = vo["filled_cost"] - o.filled_cost
                 dq = vo["cum_qty"] - o.cum_filled
                 if dn <= 0 or dc < 0 or dn < dq:
-                    self.flags.exec = "DIVERGENT"
+                    self.latch_divergence("INVALID_VENUE_NOTIONAL")
                     return False
                 self._apply_snapshot_fill(o.order_id, vo["cum_qty"], dn, dc)
                 o = self._find(o.order_id)
             if vo["filled_notional"] != o.filled_notional or vo["filled_cost"] != o.filled_cost:
-                self.flags.exec = "DIVERGENT"
+                self.latch_divergence("NOTIONAL_COST_MISMATCH")
                 return False
             if o.status == "UNKNOWN" or vo["status"] == "UNKNOWN":
                 self.flags.exec = "DIVERGENT"
                 return False
             if o.terminal:
                 if vo["status"] != o.status:
-                    self.flags.exec = "DIVERGENT"
+                    self.latch_divergence("TERMINAL_STATUS_MISMATCH")
                     return False
             elif vo["status"] in TERMINAL_VENUE:
                 self._replace_order(o.order_id, status=vo["status"])
 
-        self.flags.exec = "OK"
-        return True
+        self.flags.exec = "DIVERGENT" if self._divergence_latched else "OK"
+        return not self._divergence_latched
 
     def _recompute(self) -> None:
         active = self.ledger.working_active()
@@ -527,19 +534,15 @@ class Gateway:
             if self.flags.envelope == "OVERFLOW":
                 self.flags.envelope = "OK"
             return
-        # A6: honor configured vertex budget.
         ev = evaluate(self.ledger.state, active, self.instruments, self.cfg.mandate,
                       self.scenarios, m_vertex=self.cfg.ops.m_vertex)
         if not ev.ok:
-            # Preserve existing reservations. Never zero them on failure.
             self.flags.envelope = "OVERFLOW"
             self.log.append("OVERFLOW", {"reason": ev.reason}, self.clock.next())
             return
         self.ledger.reserved = reservations(ev)
         if self.flags.envelope == "OVERFLOW":
             self.flags.envelope = "OK"
-
-    # ---------------- recovery ----------------
 
     def recover(self) -> str:
         with self.lock:
@@ -550,7 +553,6 @@ class Gateway:
                 return "BLOCKED_NO_AUTHORITATIVE_SNAPSHOT"
             unresolved = False
             for o in self.ledger.state.working:
-                # A2: never transmitted -> nothing to resolve at the venue.
                 if o.status in LEDGER_ONLY:
                     continue
                 vo = snap["orders"].get(o.order_id)

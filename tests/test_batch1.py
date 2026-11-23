@@ -1,9 +1,4 @@
-"""
-Batch 1 acceptance tests.
-
-Run:
-    python -m pytest tests/test_batch1.py -q
-"""
+"""Batch 1 acceptance tests."""
 from __future__ import annotations
 
 import math
@@ -17,7 +12,8 @@ from sklearn.covariance import LedoitWolf
 from quant_m1.settlement import ExchangeCalendar, SettlementBook
 from quant_m1.audit import AuditLog, verify_entries
 from quant_m1.metrics import Metric, Unit, Horizon, GrossNet
-from quant_m1.cost_model import round_trip_cost_bps, corwin_schultz_full_spread
+from quant_m1.cost_model import (round_trip_cost_bps, corwin_schultz_full_spread,
+                                 assumed_spread, InadmissibleSpread)
 from quant_m1.data.evidence import Evidence, EvidenceType
 from quant_m1.data.pit import Bar, as_of_bars, history_before
 from quant_m1.research.dsr import expected_max_sharpe, probabilistic_sharpe, deflated_sharpe
@@ -79,11 +75,40 @@ def test_full_spread_not_doubled():
     assert abs(c.total_bps - 10.0) < 1e-9
 
 
-def test_corwin_schultz_positive():
+def test_corwin_schultz_returns_estimate_and_gates():
     h = np.array([101.0, 102.0, 101.5, 103.0])
     l = np.array([99.0, 100.0, 99.5, 101.0])
-    s = corwin_schultz_full_spread(h, l)
-    assert 0.0 <= s <= 1.0
+    est = corwin_schultz_full_spread(h, l)
+    assert hasattr(est, "admissible")
+    assert hasattr(est, "value_frac")
+    if est.admissible:
+        assert 0.0 <= est.value_frac <= 1.0
+    else:
+        assert est.value_frac is None
+        with pytest.raises(InadmissibleSpread):
+            est.require()
+
+
+def test_corwin_schultz_refuses_etf_scale_spread():
+    """At ETF-like spread/range ratios the estimator must REFUSE."""
+    rng = np.random.default_rng(3)
+    mid = 100.0
+    H, L = [], []
+    for _ in range(2000):
+        p = mid * np.exp(np.cumsum(rng.normal(0, 0.012 / math.sqrt(78), 78)))
+        H.append(max(mid, p.max()) * 1.00005)
+        L.append(min(mid, p.min()) * 0.99995)
+        mid = p[-1]
+    est = corwin_schultz_full_spread(np.array(H), np.array(L))
+    assert not est.admissible
+    assert est.value_frac is None
+
+
+def test_assumed_spread_is_labelled():
+    est = assumed_spread("SPY")
+    assert est.admissible
+    assert "ASSUMED" in est.note
+    assert 0 < est.value_frac < 0.01
 
 
 def test_dsr_two_term_not_single():
@@ -110,16 +135,10 @@ def test_trial_registry_counts_all(tmp_path):
     reg = TrialRegistry(str(tmp_path / "trials.jsonl"))
     for i in range(5):
         reg.log(TrialRecord(
-            config_hash=canonical_config_hash({"i": i}),
-            family="test",
-            seed=i,
-            data_vintage="fixture",
-            registered_at="2026-01-01T00:00:00+00:00",
-            metric_name="sharpe",
-            metric_value=0.1 * i,
-            horizon="annual_252_daily",
-            gross_net="net",
-        ))
+            config_hash=canonical_config_hash({"i": i}), family="test", seed=i,
+            data_vintage="fixture", registered_at="2026-01-01T00:00:00+00:00",
+            metric_name="sharpe", metric_value=0.1 * i,
+            horizon="annual_252_daily", gross_net="net"))
     assert reg.n_trials() == 5
     assert reg.effective_trials() == 5
 
@@ -148,18 +167,11 @@ def test_pit_no_lookahead():
 
 def test_evidence_known_at_before_release_rejected():
     with pytest.raises(ValueError):
-        Evidence(
-            type=EvidenceType.MACRO_RELEASE,
-            symbol=None,
-            release_ts="2024-01-02T13:30:00+00:00",
-            known_at="2024-01-02T13:29:00+00:00",
-            confidence=0.9,
-            direction=0.5,
-            magnitude=1.0,
-            source="fixture",
-            raw_ref="ref",
-            vintage_id="v1",
-        )
+        Evidence(type=EvidenceType.MACRO_RELEASE, symbol=None,
+                 release_ts="2024-01-02T13:30:00+00:00",
+                 known_at="2024-01-02T13:29:00+00:00",
+                 confidence=0.9, direction=0.5, magnitude=1.0,
+                 source="fixture", raw_ref="ref", vintage_id="v1")
 
 
 def test_purge_embargo_removes_overlap():

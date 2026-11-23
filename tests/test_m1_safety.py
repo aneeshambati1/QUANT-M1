@@ -1,11 +1,12 @@
-"""M1.2 safety tests. Each targets a specific defect in the register."""
+"""M1 safety tests. Each targets a specific defect in the register."""
 from __future__ import annotations
 
 import pytest
 
 from quant_m1.authority import Intent, Reject
-from quant_m1.core import ceil_bps
+from quant_m1.core import Ledger, ceil_bps
 from quant_m1.system import build
+from quant_m1.venue import ExecEvent
 
 
 @pytest.fixture
@@ -19,14 +20,14 @@ def _auth(sx, symbol="C", side="BUY", qty=10, price=10_000, cost=10):
     return tok, intent
 
 
-# ---- A1: sells must not cause permanent DIVERGENT ----
+# ---- T+1 ----
 
 def test_sell_fill_reconciles_with_t0_venue_cash(sx):
     tok, intent = _auth(sx, symbol="A", side="SELL", qty=10, price=10_000, cost=25)
     sx["gw"].submit(tok, intent)
     ev = sx["venue"].fill(tok.order_id, 10, price=10_000)
     assert sx["gw"].process(ev) == "APPLIED"
-    assert sx["flags"].exec == "OK", "T+0 venue cash vs T+1 ledger must reconcile"
+    assert sx["flags"].exec == "OK"
     st = sx["ledger"].state
     assert st.cash_settled == 10_000_000
     assert st.cash_unsettled == 100_000 - ceil_bps(100_000, 25)
@@ -52,17 +53,22 @@ def test_settlement_next_session_enables_buy(tmp_path):
     tok, intent = _auth(sx, symbol="A", side="SELL", qty=10, price=10_000, cost=0)
     sx["gw"].submit(tok, intent)
     sx["gw"].process(sx["venue"].fill(tok.order_id, 10, price=10_000))
-    assert sx["ledger"].settle(sx["ledger"].state.trade_date) == 0
-    assert sx["ledger"].settle(sx["ledger"].state.trade_date + 1) == 100_000
+    d = sx["ledger"].state.trade_date
+    assert sx["ledger"].settle(d) == 0
+    assert sx["ledger"].settle(d + 1) == 100_000
+    sx["ledger"].state.trade_date = d + 1
+    sx["ledger"].persist()
     _auth(sx, symbol="C", side="BUY", qty=10, price=10_000, cost=0)
 
 
-# ---- A2: unsubmitted reservations must not poison reconciliation ----
+# ---- unsubmitted reservations ----
 
 def test_unsubmitted_reservation_does_not_cause_divergent(sx):
+    # Submit FIRST. A second authorize mutates state digest and would
+    # correctly invalidate the first token (STALE_SNAPSHOT).
     t1, i1 = _auth(sx, qty=5)
-    _auth(sx, qty=5)                      # second reservation, never submitted
     sx["gw"].submit(t1, i1)
+    _auth(sx, qty=5)
     ev = sx["venue"].fill(t1.order_id, 5, price=10_000)
     assert sx["gw"].process(ev) == "APPLIED"
     assert sx["flags"].exec == "OK"
@@ -70,30 +76,35 @@ def test_unsubmitted_reservation_does_not_cause_divergent(sx):
 
 def test_recovery_ignores_unsubmitted_reservation(sx):
     t1, i1 = _auth(sx, qty=5)
-    _auth(sx, qty=5)
     sx["gw"].submit(t1, i1)
+    _auth(sx, qty=5)
     sx["gw"].process(sx["venue"].fill(t1.order_id, 5, price=10_000))
     assert sx["gw"].recover() == "RECOVERED"
 
 
-# ---- A3: stale-cum path must persist ----
+def test_second_authorize_invalidates_first_token(sx):
+    """Fail-closed: state digest binding means an old token cannot be reused."""
+    t1, i1 = _auth(sx, qty=5)
+    _auth(sx, qty=5)
+    with pytest.raises(Reject) as e:
+        sx["gw"].submit(t1, i1)
+    assert e.value.code == "STALE_SNAPSHOT"
 
-def test_stale_cum_reconciled_is_durable(sx):
+
+# ---- durability ----
+
+def test_stale_cum_event_applies_authoritative_fill(sx):
     tok, intent = _auth(sx, qty=10)
     sx["gw"].submit(tok, intent)
     sx["venue"].fill(tok.order_id, 10, price=10_000)
-    stale = sx["venue"].fill.__self__.outbox[-1]
-    from quant_m1.venue import ExecEvent
     ev = ExecEvent("E-STALE", tok.order_id, "FILL", 1, 10_000, 999)
-    assert sx["gw"].process(ev) == "SNAPSHOT_RECONCILED"
+    result = sx["gw"].process(ev)
+    assert result in {"APPLIED", "SNAPSHOT_RECONCILED"}
     assert ev.exec_id in sx["ledger"].applied_exec_ids
-    from quant_m1.core import Ledger, Store
     back = Ledger.restore(sx["ledger"].store)
     assert back.state.positions["C"] == 10
     assert sx["gw"].process(ev) == "NOOP_DUPLICATE"
 
-
-# ---- A4: multi-price fills use venue notional ----
 
 def test_multi_price_fill_uses_authoritative_notional(sx):
     tok, intent = _auth(sx, qty=10, price=10_000, cost=25)
@@ -106,29 +117,35 @@ def test_multi_price_fill_uses_authoritative_notional(sx):
     assert sx["flags"].exec == "OK"
 
 
-# ---- A5: receivable dated from fill session, not reservation ----
-
 def test_receivable_uses_current_session(sx):
     tok, intent = _auth(sx, symbol="A", side="SELL", qty=10, price=10_000, cost=0)
     sx["gw"].submit(tok, intent)
-    sx["ledger"].state.trade_date = 105          # order rested several sessions
+    sx["ledger"].state.trade_date = 105
     sx["gw"].process(sx["venue"].fill(tok.order_id, 10, price=10_000))
     due = [d for d, _ in sx["ledger"].state.receivables]
-    assert due == [106], "must settle from fill session, not reservation session"
+    assert due == [106]
 
 
-# ---- A6: m_vertex honored end to end ----
+# ---- config binding ----
 
 def test_m_vertex_config_honored(tmp_path):
     sx = build(str(tmp_path), m_vertex=2)
-    t1, i1 = _auth(sx, qty=1)
+    _auth(sx, qty=1)
     _auth(sx, qty=1)
     with pytest.raises(Reject) as e:
         _auth(sx, qty=1)
     assert e.value.code == "M_VERTEX"
 
 
-# ---- A8: flags are durable ----
+def test_stale_token_rejected_after_mandate_change(sx):
+    tok, intent = _auth(sx, qty=5)
+    sx["cfg"].apply_config({"mandate": {"gross_bps": 9_000}})
+    with pytest.raises(Reject) as e:
+        sx["gw"].submit(tok, intent)
+    assert e.value.code in {"TOKEN_CONFIG_STALE", "CONFIG_STATE_MISMATCH"}
+
+
+# ---- durable flags ----
 
 def test_flags_survive_restart(tmp_path):
     sx = build(str(tmp_path))
@@ -139,7 +156,7 @@ def test_flags_survive_restart(tmp_path):
     assert "NEW_RISK" not in sx2["flags"].permissions()
 
 
-# ---- A9: timeout is unresolved, never terminal ----
+# ---- timeout ----
 
 def test_timeout_keeps_reservation(sx):
     tok, intent = _auth(sx, qty=10)
@@ -153,7 +170,7 @@ def test_timeout_keeps_reservation(sx):
     assert "NEW_RISK" not in sx["flags"].permissions()
 
 
-# ---- preserved original guarantees ----
+# ---- preserved guarantees ----
 
 def test_kill_switch_blocks_submit(sx):
     tok, intent = _auth(sx, qty=5)

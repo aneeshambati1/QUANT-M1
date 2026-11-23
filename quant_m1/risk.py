@@ -1,4 +1,14 @@
-"""M1.3 deterministic reachable-fill risk evaluation. Per-SimState marks."""
+"""M1.4 deterministic reachable-fill risk evaluation. Per-SimState marks.
+
+M1.4 FIX: risk-reducing exemption.
+  A trade whose worst-case usage does not increase ANY constraint is allowed
+  even when the base book already breaches a soft concentration limit.
+  Without this, a breached position can never be reduced.
+  Hard floors (short reachable, negative settled cash, non-positive NAV)
+  are NEVER exempted.
+  worst_loss / cvar are floored at 0 for the reducing comparison, because
+  moving from a stress GAIN to zero is not an increase in risk.
+"""
 from __future__ import annotations
 
 import itertools
@@ -108,6 +118,18 @@ def set_marks(_marks: dict[str, Money]) -> None:
 
 
 CONSTRAINTS = ("gross", "issuer_max", "factor_abs", "worst_loss", "cvar", "neg_cash")
+LOSS_CONSTRAINTS = frozenset({"worst_loss", "cvar"})
+
+
+def is_risk_reducing(worst: dict[str, int], base: dict[str, int]) -> bool:
+    """True when no constraint usage increases. Loss metrics floored at 0."""
+    for c in CONSTRAINTS:
+        w, b = worst[c], base[c]
+        if c in LOSS_CONSTRAINTS:
+            w, b = max(0, w), max(0, b)
+        if w > b:
+            return False
+    return True
 
 
 @dataclass(frozen=True)
@@ -141,6 +163,7 @@ def evaluate(base: VerifiedState, orders: tuple[WorkingOrder, ...],
         for v in vertices(m):
             n += 1
             sim = simulate(base, orders, v, 1, instruments, mandate.settle_lag_days)
+            # HARD FLOORS: never exempted, even for risk-reducing trades.
             if any(q < 0 for q in sim.positions.values()):
                 return Evaluation(False, "SHORT_REACHABLE", {}, {}, 0, False, n)
             if sim.cash_settled < 0:
@@ -151,6 +174,9 @@ def evaluate(base: VerifiedState, orders: tuple[WorkingOrder, ...],
                 max_d[c] = max(max_d[c], getattr(u, c))
         if nav_min <= 0:
             return Evaluation(False, "NAV_NONPOSITIVE", max_d, base_d, nav_min, False, n)
+
+        reducing = is_risk_reducing(max_d, base_d)
+
         checks = (
             ("gross", max_d["gross"], floor_bps(nav_min, mandate.gross_bps), "GROSS"),
             ("issuer_max", max_d["issuer_max"], floor_bps(nav_min, mandate.issuer_bps), "ISSUER"),
@@ -160,8 +186,10 @@ def evaluate(base: VerifiedState, orders: tuple[WorkingOrder, ...],
         )
         for _, got, lim, name in checks:
             if got > lim:
+                if reducing:
+                    # Pre-existing breach. Allow de-risking, do not trap the book.
+                    continue
                 return Evaluation(False, f"LIMIT_{name}", max_d, base_d, nav_min, False, n)
-        reducing = all(max_d[c] <= base_d[c] for c in CONSTRAINTS)
         return Evaluation(True, "OK", max_d, base_d, nav_min, reducing, n)
     except (ValueError, KeyError, ZeroDivisionError) as exc:
         return Evaluation(False, f"INVALID_RISK_INPUT:{type(exc).__name__}", {}, {}, 0, False, 0)

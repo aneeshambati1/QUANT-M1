@@ -1,6 +1,20 @@
-"""Deterministic M1.1 mock venue. No network or real broker access."""
+"""Deterministic M1.2 mock venue. No network or real broker access.
+
+M1.2 changes (API-preserving):
+  - FIX: ExecEvent.seq now monotonically increasing (was always 0)
+  - FIX: cancel_ack no longer relabels REJECTED as CANCELLED
+  - ADD: timeout() -> UNKNOWN state event
+  - ADD: snapshot() declares cash_is_t0 so reconciliation cannot
+         compare venue T+0 cash against ledger T+1 cash_settled alone
+
+RECONCILIATION RULE:
+    venue.cash  ==  ledger.cash_settled + ledger.receivable_total()
+NOT venue.cash  ==  ledger.cash_settled
+"""
 from __future__ import annotations
+
 from dataclasses import dataclass, field
+
 from .core import Money, Shares, ceil_bps
 
 
@@ -41,10 +55,20 @@ class MockVenue:
     _eid: int = 0
     present: bool = True
     snapshot_available: bool = True
+    _seq: int = 0
 
     def _next_eid(self) -> str:
         self._eid += 1
         return f"E{self._eid:06d}"
+
+    def _next_seq(self) -> int:
+        self._seq += 1
+        return self._seq
+
+    def _emit(self, order_id: str, kind: str, cum: Shares, px: Money) -> ExecEvent:
+        ev = ExecEvent(self._next_eid(), order_id, kind, cum, px, self._next_seq())
+        self.outbox.append(ev)
+        return ev
 
     def send(self, order_id: str, symbol: str, side: str, qty: Shares,
              price: Money, cost_bps: int = 0) -> None:
@@ -63,7 +87,7 @@ class MockVenue:
         self.orders[order_id] = VenueOrder(
             order_id, symbol, side, qty, 0, price, "ACKNOWLEDGED", 0, 0, cost_bps
         )
-        self.outbox.append(ExecEvent(self._next_eid(), order_id, "ACK", 0, price))
+        self._emit(order_id, "ACK", 0, price)
 
     def fill(self, order_id: str, q: Shares, price: Money | None = None,
              dup: bool = False, stale_cum: int | None = None) -> ExecEvent:
@@ -79,42 +103,42 @@ class MockVenue:
         signed = q if o.side == "BUY" else -q
         self.positions[o.symbol] = self.positions.get(o.symbol, 0) + signed
         self.cash += (-signed * px) - fill_cost
-        eid = self._next_eid()
         cum = o.cum_qty if stale_cum is None else stale_cum
-        ev = ExecEvent(eid, order_id, "FILL", cum, px)
-        self.outbox.append(ev)
+        ev = self._emit(order_id, "FILL", cum, px)
         if dup:
             self.outbox.append(ev)
         return ev
 
     def cancel_ack(self, order_id: str) -> ExecEvent:
         o = self.orders[order_id]
-        if o.status != "FILLED":
+        if o.status not in {"FILLED", "REJECTED", "EXPIRED"}:
             o.status = "CANCELLED"
-        ev = ExecEvent(self._next_eid(), order_id, "CANCEL_ACK", o.cum_qty, o.price)
-        self.outbox.append(ev)
-        return ev
+        return self._emit(order_id, "CANCEL_ACK", o.cum_qty, o.price)
 
     def cancel_reject(self, order_id: str) -> ExecEvent:
         o = self.orders[order_id]
-        ev = ExecEvent(self._next_eid(), order_id, "CANCEL_REJECT", o.cum_qty, o.price)
-        self.outbox.append(ev)
-        return ev
+        return self._emit(order_id, "CANCEL_REJECT", o.cum_qty, o.price)
 
     def reject(self, order_id: str) -> ExecEvent:
         o = self.orders[order_id]
         if o.cum_qty:
             raise ValueError("cannot reject an already-filled order")
         o.status = "REJECTED"
-        ev = ExecEvent(self._next_eid(), order_id, "REJECT", 0, o.price)
-        self.outbox.append(ev)
-        return ev
+        return self._emit(order_id, "REJECT", 0, o.price)
+
+    def timeout(self, order_id: str) -> ExecEvent:
+        """Order state becomes UNKNOWN. Gateway must freeze, not infer rejection."""
+        o = self.orders[order_id]
+        if o.status not in {"FILLED", "CANCELLED", "REJECTED"}:
+            o.status = "UNKNOWN"
+        return self._emit(order_id, "TIMEOUT", o.cum_qty, o.price)
 
     def snapshot(self) -> dict | None:
         if not self.present or not self.snapshot_available:
             return None
         return {
             "complete": True,
+            "cash_is_t0": True,
             "orders": {
                 k: {
                     "cum_qty": v.cum_qty,

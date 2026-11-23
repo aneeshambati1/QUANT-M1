@@ -8,10 +8,17 @@ from .core import (
 from .flags import Flags
 from .venue import MockVenue
 from .authority import Kernel, Gateway
-
-
-def build(tmpdir: str, cash: int = 10_000_000, positions=None, marks=None):
-    os.makedirs(tmpdir, exist_ok=True)
+def build(
+    tmpdir: str,
+    cash: int = 10_000_000,          # keep: settled cash for backward compatibility
+    positions=None,
+    marks=None,
+    cash_unsettled: int = 0,         # ADD
+    pending_settlements=(),          # ADD
+    calendar=None,                   # ADD: exchange calendar
+    as_of=None,                      # ADD: current business date
+    allow_live: bool = False,        # ADD: must default False
+):
     positions = positions or {"A": 300, "B": 300}
     marks = marks or {"A": 10_000, "B": 10_000, "C": 10_000}
 

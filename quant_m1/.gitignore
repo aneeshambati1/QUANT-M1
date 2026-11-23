@@ -1,0 +1,37 @@
+# secrets
+.env
+.env.*
+secrets/
+*.key
+*.pem
+*.p12
+*.pfx
+credentials.json
+broker.json
+
+# python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.coverage
+htmlcov/
+.mypy_cache/
+.ruff_cache/
+build/
+dist/
+*.egg-info/
+
+# local data / logs
+data/raw/
+data/cache/
+logs/
+*.log
+*.sqlite
+*.db
+
+# notebooks
+.ipynb_checkpoints/
+
+# OS
+.DS_Store
+Thumbs.db

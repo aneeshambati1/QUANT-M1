@@ -5,10 +5,9 @@ Changes over M1.4:
   - A newly breached constraint always rejects.
   - A pre-existing breach may be waived only when its worst reachable usage
     does not worsen (loss metrics floored at zero for the comparison).
+  - Worsening an already-breached constraint rejects even if another improves.
   - Hard floors (short reachable, negative settled cash, non-positive NAV)
     are NEVER exempted.
-  - factor_abs remains ABSOLUTE net beta exposure in dollars. The mandate
-    calibration determines core-book reachability; no duplicate metric.
 
 usage(), simulate(), CONSTRAINTS, LOSS_CONSTRAINTS, and is_risk_reducing()
 are unchanged from M1.4 so that reference.py's oracle stays valid.
@@ -193,12 +192,12 @@ def evaluate(base: VerifiedState, orders: tuple[WorkingOrder, ...],
             ("cvar", max_d["cvar"], floor_bps(nav0, mandate.cvar_bps), "CVAR"),
         )
 
-        # 1. Any NEW breach rejects immediately, regardless of other dimensions.
+        # PASS 1: Any NEW breach rejects immediately.
         for c, got, lim, name in checks:
             if got > lim and base_d[c] <= lim:
                 return Evaluation(False, f"LIMIT_{name}", max_d, base_d, nav_min, False, n)
 
-        # 2. Pre-existing breaches may be waived only if not worsening.
+        # PASS 2: Pre-existing breaches waived only if not worsening.
         for c, got, lim, name in checks:
             if got > lim:
                 w, b = max_d[c], base_d[c]

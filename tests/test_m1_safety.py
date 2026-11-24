@@ -90,6 +90,7 @@ def test_recovery_ignores_unsubmitted_reservation(sx):
 
 
 def test_second_authorize_invalidates_first_token(sx):
+    """Fail-closed: state digest binding means an old token cannot be reused."""
     t1, i1 = _auth(sx, qty=5)
     _auth(sx, qty=5)
     with pytest.raises(Reject) as e:

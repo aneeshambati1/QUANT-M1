@@ -1,19 +1,17 @@
-"""Core M1.2: integer units, config authority, durable ledger and state.
+"""Core M1.5: integer units, config authority, durable ledger and state.
 
-M1.2 changes (API-preserving):
-  - FIX: removed stray module-level fields that broke import
-  - FIX: VerifiedState.digest() now includes mark_wall
-  - FIX: EventLog redacts secrets, exposes immutable entries(), verify()
-  - FIX: ConfigAuthority validates ranges and requires attestation
-  - FIX: WorkingOrder validates numeric invariants
-  - ADD: VerifiedState.cash_unsettled property (receivables IS the unsettled bucket)
-  - ADD: Ledger.snapshot() immutable view
-  - ADD: Ledger.record_sell_receivable() T+1 due-date computation
-  - ADD: Ledger.verify_invariants()
-  - ADD: EventLog.append returns hash unchanged; settle() returns released amount
+G0 changes over M1.2:
+  - Unknown issuer holdings aggregate into ONE conservative bucket: UNK:ALL.
+  - Ledger has a monotonic settlement-session guard.
+  - Ledger.advance_session() is the single session-advance authority.
+  - ConfigAuthority rejects unknown top-level config sections, including floor.
+  - Config changes are constructed before commit and rolled back on failure.
+  - Mandate version/digest can be propagated explicitly into VerifiedState.
+  - Composite atomic persistence helpers are provided for Gateway use.
 
-NOTE: receivables is the SINGLE source of truth for unsettled money.
-      Do not add a parallel cash_unsettled field.
+IMPORTANT:
+  receivables is the SINGLE source of truth for unsettled money.
+  Do not add a parallel cash_unsettled field.
 """
 from __future__ import annotations
 
@@ -91,7 +89,12 @@ class Mandate:
     version: int
     gross_bps: int = 10_000
     issuer_bps: int = 4_000
-    factor_bps: int = 6_000
+
+    # G0 decision: factor_bps is an ABSOLUTE net-beta cap.
+    # A fully invested beta-1 core book requires up to 10_000 bps.
+    # Benchmark-relative active factor exposure is deferred until a benchmark exists.
+    factor_bps: int = 10_000
+
     worst_loss_bps: int = 1_500
     cvar_bps: int = 1_200
     cvar_q_bps: int = 2_500
@@ -171,22 +174,62 @@ class ConfigAuthority:
     def apply_config(self, diff: dict) -> None:
         if not self.attested():
             raise ConfigAuthorityError("CONFIG rejected: immutable floor unattested")
+
+        allowed = {"mandate", "ops"}
+        unknown = set(diff) - allowed
+        if unknown:
+            raise ConfigAuthorityError(
+                f"CONFIG rejected: unsupported sections {sorted(unknown)}"
+            )
+
         illegal = IMMUTABLE_FIELDS & set(diff)
         if illegal:
-            raise ConfigAuthorityError(f"CONFIG attempted immutable change: {sorted(illegal)}")
-        if "mandate" in diff:
-            md = dict(diff["mandate"])
-            md["allowlist"] = frozenset(md.get("allowlist", self.mandate.allowlist))
-            md["product_classes"] = frozenset(
-                md.get("product_classes", self.mandate.product_classes)
+            raise ConfigAuthorityError(
+                f"CONFIG attempted immutable change: {sorted(illegal)}"
             )
-            self.mandate = Mandate(**{**asdict(self.mandate), **md,
-                                      "version": self.mandate.version + 1})
-        if "ops" in diff:
-            self.ops = Operational(**{**asdict(self.ops), **diff["ops"],
-                                      "version": self.ops.version + 1})
-        if not self.attested():
-            raise ConfigAuthorityError("CONFIG corrupted immutable floor")
+
+        old_mandate = self.mandate
+        old_ops = self.ops
+
+        try:
+            new_mandate = self.mandate
+            new_ops = self.ops
+
+            if "mandate" in diff:
+                md = dict(diff["mandate"])
+                md["allowlist"] = frozenset(
+                    md.get("allowlist", self.mandate.allowlist)
+                )
+                md["product_classes"] = frozenset(
+                    md.get("product_classes", self.mandate.product_classes)
+                )
+                new_mandate = Mandate(
+                    **{
+                        **asdict(self.mandate),
+                        **md,
+                        "version": self.mandate.version + 1,
+                    }
+                )
+
+            if "ops" in diff:
+                new_ops = Operational(
+                    **{
+                        **asdict(self.ops),
+                        **diff["ops"],
+                        "version": self.ops.version + 1,
+                    }
+                )
+
+            if not self.attested():
+                raise ConfigAuthorityError("CONFIG corrupted immutable floor")
+
+            self.mandate = new_mandate
+            self.ops = new_ops
+
+        except Exception:
+            self.mandate = old_mandate
+            self.ops = old_ops
+            raise
 
     def attested(self) -> bool:
         return hmac.compare_digest(self.floor.digest(), self._floor_digest)
@@ -303,11 +346,16 @@ class Instrument:
     halted: bool = False
 
     def lookthrough(self) -> tuple[tuple[str, int], ...]:
+        """Conservative issuer look-through.
+
+        Missing or invalid holdings are aggregated into ONE shared unknown bucket.
+        This prevents two unknown ETFs from passing separately under an issuer cap.
+        """
         if self.holdings is None:
-            return ((f"UNK:{self.symbol}", BPS),)
+            return (("UNK:ALL", BPS),)
         tot = sum(w for _, w in self.holdings)
         if tot != BPS or any(w < 0 for _, w in self.holdings):
-            return ((f"UNK:{self.symbol}", BPS),)
+            return (("UNK:ALL", BPS),)
         return self.holdings
 
 
@@ -370,17 +418,25 @@ class VerifiedState:
     def nav(self) -> Money:
         if any(s not in self.marks for s, q in self.positions.items() if q):
             raise ValueError("position has no current mark")
-        return (self.cash_settled + self.receivable_total()
-                + sum(q * self.marks[s] for s, q in self.positions.items() if q))
+        return (
+            self.cash_settled
+            + self.receivable_total()
+            + sum(q * self.marks[s] for s, q in self.positions.items() if q)
+        )
 
     def digest(self) -> str:
         return sha({
-            "seq": self.seq, "date": self.trade_date, "cash": self.cash_settled,
-            "recv": sorted(self.receivables), "pos": self.positions,
-            "marks": self.marks, "mark_wall": self.mark_wall,
+            "seq": self.seq,
+            "date": self.trade_date,
+            "cash": self.cash_settled,
+            "recv": sorted(self.receivables),
+            "pos": self.positions,
+            "marks": self.marks,
+            "mark_wall": self.mark_wall,
             "peak": self.peak_nav,
             "working": [asdict(o) for o in self.working],
-            "mv": self.mandate_version, "cd": self.config_digest,
+            "mv": self.mandate_version,
+            "cd": self.config_digest,
         })
 
 
@@ -418,14 +474,20 @@ class Ledger:
     reserved: dict[str, int] = field(default_factory=dict)
     applied_exec_hashes: dict[str, str] = field(default_factory=dict)
 
-    def persist(self) -> None:
-        self.store.save({
+    # Appended LAST to preserve positional construction compatibility.
+    last_settled_session: int = -1
+
+    def to_dict(self) -> dict:
+        return {
             "state": {
-                "seq": self.state.seq, "trade_date": self.state.trade_date,
+                "seq": self.state.seq,
+                "trade_date": self.state.trade_date,
                 "cash_settled": self.state.cash_settled,
                 "receivables": list(self.state.receivables),
-                "positions": self.state.positions, "marks": self.state.marks,
-                "mark_wall": self.state.mark_wall, "peak_nav": self.state.peak_nav,
+                "positions": self.state.positions,
+                "marks": self.state.marks,
+                "mark_wall": self.state.mark_wall,
+                "peak_nav": self.state.peak_nav,
                 "mandate_version": self.state.mandate_version,
                 "config_digest": self.state.config_digest,
                 "working": [asdict(o) for o in self.state.working],
@@ -435,28 +497,50 @@ class Ledger:
             "applied_exec_hashes": self.applied_exec_hashes,
             "submit_seq": self.submit_seq,
             "reserved": self.reserved,
-        })
+            "last_settled_session": self.last_settled_session,
+        }
+
+    def persist(self) -> None:
+        self.store.save(self.to_dict())
+
+    @staticmethod
+    def from_dict(d: dict, store: Store) -> "Ledger":
+        s = d["state"]
+        known = set(WorkingOrder.__dataclass_fields__)
+        working = [
+            WorkingOrder(**{k: v for k, v in item.items() if k in known})
+            for item in s["working"]
+        ]
+        st = VerifiedState(
+            seq=s["seq"],
+            trade_date=s["trade_date"],
+            cash_settled=s["cash_settled"],
+            receivables=tuple(tuple(x) for x in s["receivables"]),
+            positions=dict(s["positions"]),
+            marks=dict(s["marks"]),
+            mark_wall=s["mark_wall"],
+            peak_nav=s["peak_nav"],
+            mandate_version=s["mandate_version"],
+            config_digest=s["config_digest"],
+            working=tuple(working),
+        )
+        return Ledger(
+            store,
+            st,
+            set(d.get("spent_nonces", [])),
+            set(d.get("applied_exec_ids", [])),
+            list(d.get("submit_seq", [])),
+            dict(d.get("reserved", {})),
+            dict(d.get("applied_exec_hashes", {})),
+            int(d.get("last_settled_session", -1)),
+        )
 
     @staticmethod
     def restore(store: Store) -> "Ledger | None":
         d = store.load()
         if d is None:
             return None
-        s = d["state"]
-        known = set(WorkingOrder.__dataclass_fields__)
-        working = [WorkingOrder(**{k: v for k, v in item.items() if k in known})
-                   for item in s["working"]]
-        st = VerifiedState(
-            seq=s["seq"], trade_date=s["trade_date"], cash_settled=s["cash_settled"],
-            receivables=tuple(tuple(x) for x in s["receivables"]),
-            positions=dict(s["positions"]), marks=dict(s["marks"]),
-            mark_wall=s["mark_wall"], peak_nav=s["peak_nav"],
-            mandate_version=s["mandate_version"], config_digest=s["config_digest"],
-            working=tuple(working),
-        )
-        return Ledger(store, st, set(d.get("spent_nonces", [])),
-                      set(d.get("applied_exec_ids", [])), list(d.get("submit_seq", [])),
-                      dict(d.get("reserved", {})), dict(d.get("applied_exec_hashes", {})))
+        return Ledger.from_dict(d, store)
 
     def snapshot(self) -> LedgerSnapshot:
         return LedgerSnapshot(
@@ -493,13 +577,60 @@ class Ledger:
         return due
 
     def settle(self, today: int) -> Money:
-        """Release matured receivables. Returns amount released."""
+        """Release matured receivables. Returns amount released.
+
+        Session regression is rejected.
+        """
+        if today < self.last_settled_session:
+            raise ValueError(
+                f"SETTLEMENT_REGRESSION: {today} < {self.last_settled_session}"
+            )
+
         due = sum(c for d, c in self.state.receivables if d <= today)
         self.state.receivables = tuple(
             (d, c) for d, c in self.state.receivables if d > today
         )
         self.state.cash_settled += due
+        self.last_settled_session = today
         return due
+
+    def advance_session(
+        self,
+        new_trade_date: int,
+        new_mark_wall: int,
+        marks: dict[str, Money],
+    ) -> Money:
+        """Single session-advance authority.
+
+        Caller must also advance Clock.wall consistently before authorization.
+        This method updates ledger session, settles matured receivables,
+        refreshes marks, and marks peak NAV.
+        """
+        if new_trade_date <= self.state.trade_date:
+            raise ValueError("SESSION_REGRESSION_OR_STASIS")
+        if new_mark_wall < self.state.mark_wall:
+            raise ValueError("MARK_WALL_REGRESSION")
+        if any(not isinstance(v, int) or v <= 0 for v in marks.values()):
+            raise ValueError("marks must be positive integer cents")
+
+        released = self.settle(new_trade_date)
+        self.state.trade_date = new_trade_date
+        self.state.mark_wall = new_mark_wall
+        self.state.marks = dict(marks)
+        self.mark_peak()
+        self.persist()
+        return released
+
+    def propagate_config(self, mandate_version: int, config_digest: str) -> None:
+        """Explicit controlled propagation of a new mandate into VerifiedState.
+
+        This does not authorize orders. It only updates state binding.
+        """
+        if mandate_version < self.state.mandate_version:
+            raise ValueError("MANDATE_VERSION_REGRESSION")
+        self.state.mandate_version = mandate_version
+        self.state.config_digest = config_digest
+        self.persist()
 
     def mark_peak(self) -> None:
         self.state.peak_nav = max(self.state.peak_nav, self.state.nav())
@@ -511,7 +642,9 @@ class Ledger:
         return (pk - self.state.nav()) * BPS // pk
 
     def working_active(self) -> tuple[WorkingOrder, ...]:
-        return tuple(o for o in self.state.working if not o.terminal and o.remaining > 0)
+        return tuple(
+            o for o in self.state.working if not o.terminal and o.remaining > 0
+        )
 
     def verify_invariants(self) -> None:
         s = self.state

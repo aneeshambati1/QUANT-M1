@@ -32,7 +32,7 @@ import uuid
 from dataclasses import asdict, dataclass
 
 from .core import (Money, Shares, Clock, ConfigAuthority, EventLog, Instrument,
-                   Ledger, Store, WorkingOrder, ceil_bps, sha)
+                   Ledger, Store, WorkingOrder, sha)
 from .flags import Flags
 from .risk import evaluate, reservations, CONSTRAINTS
 from .venue import MockVenue, ExecEvent

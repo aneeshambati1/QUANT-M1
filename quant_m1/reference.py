@@ -1,36 +1,58 @@
-"""Independent test-only implementations. Different code path from risk.py."""
+"""Independent test-only oracle. Mirrors risk.py usage() semantics exactly.
+
+Uses integer ceil_bps aggregation and shared UNK:ALL bucket to match
+production Instrument.lookthrough() and usage() behavior.
+"""
 from __future__ import annotations
 
 from fractions import Fraction
 
-BPS = 10_000
+from .core import BPS, ceil_bps
 
 
 def _ceil_frac(x: Fraction) -> int:
     return -((-x.numerator) // x.denominator)
 
 
-def ref_nav(cash, recv, positions, marks):
+def ref_nav(cash: int, recv: int, positions: dict[str, int],
+            marks: dict[str, int]) -> Fraction:
     total = Fraction(cash) + Fraction(recv)
     for s, q in positions.items():
         total += Fraction(q) * Fraction(marks[s])
     return total
 
 
-def ref_gross(positions, marks):
+def ref_gross(positions: dict[str, int], marks: dict[str, int]) -> Fraction:
     return sum(Fraction(q) * Fraction(marks[s]) for s, q in positions.items())
 
 
-def ref_issuer(positions, marks, instruments):
-    acc = {}
+def ref_gross_abs(positions: dict[str, int], marks: dict[str, int]) -> int:
+    return sum(abs(int(q) * int(marks[s])) for s, q in positions.items())
+
+
+def ref_issuer(positions: dict[str, int], marks: dict[str, int],
+               instruments: dict) -> int:
+    """Integer issuer exposure matching production usage().issuer_max.
+
+    Uses ceil_bps and shared UNK:ALL bucket via lookthrough().
+    """
+    acc: dict[str, int] = {}
     for s, q in positions.items():
-        val = Fraction(q) * Fraction(marks[s])
+        if q == 0:
+            continue
+        val = abs(int(q) * int(marks[s]))
         for iss, w in instruments[s].lookthrough():
-            acc[iss] = acc.get(iss, Fraction(0)) + val * Fraction(w, BPS)
-    return max(acc.values(), default=Fraction(0))
+            acc[iss] = acc.get(iss, 0) + ceil_bps(val, w)
+    return max(acc.values(), default=0)
 
 
-def ref_settled(cash, orders, fracs):
+def ref_issuer_abs(positions: dict[str, int], marks: dict[str, int],
+                   instruments: dict) -> int:
+    """Alias kept for backward compatibility. Identical to ref_issuer."""
+    return ref_issuer(positions, marks, instruments)
+
+
+def ref_settled(cash: int, orders: tuple, fracs: tuple) -> Fraction:
     """Sells never add settled cash in-window."""
     out = Fraction(cash)
     for o, f in zip(orders, fracs):
@@ -41,20 +63,7 @@ def ref_settled(cash, orders, fracs):
     return out
 
 
-def ref_gross_abs(positions, marks):
-    return sum(abs(Fraction(q) * Fraction(marks[s])) for s, q in positions.items())
-
-
-def ref_issuer_abs(positions, marks, instruments):
-    acc: dict[str, int] = {}
-    for s, q in positions.items():
-        val = abs(int(q) * int(marks[s]))
-        for iss, w in instruments[s].lookthrough():
-            acc[iss] = acc.get(iss, 0) + _ceil_frac(Fraction(val * w, BPS))
-    return max(acc.values(), default=0)
-
-
-def ref_settled_ceil(cash, orders, fracs):
+def ref_settled_ceil(cash: int, orders: tuple, fracs: tuple) -> int:
     out = int(cash)
     for o, f in zip(orders, fracs):
         if o.side == "BUY":
@@ -64,7 +73,7 @@ def ref_settled_ceil(cash, orders, fracs):
     return out
 
 
-def ref_receivable(recv, orders, fracs):
+def ref_receivable(recv: int, orders: tuple, fracs: tuple) -> Fraction:
     out = Fraction(recv)
     for o, f in zip(orders, fracs):
         if o.side == "SELL":

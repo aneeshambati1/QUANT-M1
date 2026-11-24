@@ -1,4 +1,10 @@
-"""M1 safety tests. Each targets a specific defect in the register."""
+"""M1 safety tests. Each targets a specific defect in the register.
+
+Updated for M1.5 authority.py:
+  - Stale-cum test asserts SNAPSHOT_RECONCILED (not APPLIED).
+  - Settlement test compatible with monotonic settle guard.
+  - Flags restart test compatible with composite persistence.
+"""
 from __future__ import annotations
 
 import pytest
@@ -54,7 +60,9 @@ def test_settlement_next_session_enables_buy(tmp_path):
     sx["gw"].submit(tok, intent)
     sx["gw"].process(sx["venue"].fill(tok.order_id, 10, price=10_000))
     d = sx["ledger"].state.trade_date
+    # Monotonic guard: settle(d) sets last_settled_session=d, releases 0.
     assert sx["ledger"].settle(d) == 0
+    # settle(d+1) > last_settled_session, releases matured receivable.
     assert sx["ledger"].settle(d + 1) == 100_000
     sx["ledger"].state.trade_date = d + 1
     sx["ledger"].persist()
@@ -64,8 +72,6 @@ def test_settlement_next_session_enables_buy(tmp_path):
 # ---- unsubmitted reservations ----
 
 def test_unsubmitted_reservation_does_not_cause_divergent(sx):
-    # Submit FIRST. A second authorize mutates state digest and would
-    # correctly invalidate the first token (STALE_SNAPSHOT).
     t1, i1 = _auth(sx, qty=5)
     sx["gw"].submit(t1, i1)
     _auth(sx, qty=5)
@@ -83,7 +89,6 @@ def test_recovery_ignores_unsubmitted_reservation(sx):
 
 
 def test_second_authorize_invalidates_first_token(sx):
-    """Fail-closed: state digest binding means an old token cannot be reused."""
     t1, i1 = _auth(sx, qty=5)
     _auth(sx, qty=5)
     with pytest.raises(Reject) as e:
@@ -93,13 +98,14 @@ def test_second_authorize_invalidates_first_token(sx):
 
 # ---- durability ----
 
-def test_stale_cum_event_applies_authoritative_fill(sx):
+def test_stale_cum_event_returns_snapshot_reconciled(sx):
+    """With the stale-o fix, stale cum always returns SNAPSHOT_RECONCILED."""
     tok, intent = _auth(sx, qty=10)
     sx["gw"].submit(tok, intent)
     sx["venue"].fill(tok.order_id, 10, price=10_000)
     ev = ExecEvent("E-STALE", tok.order_id, "FILL", 1, 10_000, 999)
     result = sx["gw"].process(ev)
-    assert result in {"APPLIED", "SNAPSHOT_RECONCILED"}
+    assert result == "SNAPSHOT_RECONCILED"
     assert ev.exec_id in sx["ledger"].applied_exec_ids
     back = Ledger.restore(sx["ledger"].store)
     assert back.state.positions["C"] == 10

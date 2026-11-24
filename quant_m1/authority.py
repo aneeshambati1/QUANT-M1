@@ -518,232 +518,158 @@ class Gateway:
                                      "order_id": ev.order_id, "cum_qty": ev.cum_qty,
                                      "price": ev.price, "reconciled": reconciled},
                             self.clock.next())
-            return "APPLIED" if reconcHere are the two complete file replacements. Copy each one in full and overwrite the corresponding file in your repo.
+            return "APPLIED" if reconciled else "APPLIED_RECONCILE_DIVERGENT"
 
-**UNEXECUTED — NO RESULT CLAIMED.** I have read your current `main` branch via `raw.githubusercontent.com`. These are designed against that source. I have not run them. Run `pytest -q` after replacing and report the actual count.
+    def _record_exec(self, ev: ExecEvent, event_hash: str) -> None:
+        self.ledger.applied_exec_ids.add(ev.exec_id)
+        self.ledger.applied_exec_hashes[ev.exec_id] = event_hash
 
----
+    def _apply_snapshot_fill(self, order_id: str, cum: int,
+                             delta_notional: int, delta_cost: int) -> None:
+        o = self._find(order_id)
+        if o is None:
+            raise Reject("UNKNOWN_ORDER")
+        dq = cum - o.cum_filled
+        if dq <= 0 or cum > o.qty or delta_notional <= 0 or delta_cost < 0:
+            raise Reject("INVALID_SNAPSHOT_FILL")
 
-## File 1: `quant_m1/risk.py`
-
-```python
-"""M1.5 deterministic reachable-fill risk evaluation. Per-SimState marks.
-
-Changes over M1.4:
-  - Per-constraint risk-reducing exemption replaces the all-or-nothing gate.
-  - A newly breached constraint always rejects.
-  - A pre-existing breach may be waived only when its worst reachable usage
-    does not worsen (loss metrics floored at zero for the comparison).
-  - Hard floors (short reachable, negative settled cash, non-positive NAV)
-    are NEVER exempted.
-  - factor_abs remains ABSOLUTE net beta exposure in dollars. The mandate
-    calibration determines core-book reachability; no duplicate metric.
-
-usage(), simulate(), CONSTRAINTS, LOSS_CONSTRAINTS, and is_risk_reducing()
-are unchanged from M1.4 so that reference.py's oracle stays valid.
-"""
-from __future__ import annotations
-
-import itertools
-from dataclasses import dataclass
-
-from .core import (Money, Shares, BPS, Mandate, Instrument, WorkingOrder,
-                   VerifiedState, ceil_bps, floor_bps)
-
-
-@dataclass(frozen=True)
-class SimState:
-    positions: dict[str, Shares]
-    cash_settled: Money
-    receivable_total: Money
-    nav: Money
-    marks: dict[str, Money]
-
-
-def simulate(base: VerifiedState, orders: tuple[WorkingOrder, ...],
-             nums: tuple[int, ...], den: int, instruments: dict[str, Instrument],
-             settle_lag: int) -> SimState:
-    if den <= 0 or len(nums) != len(orders) or any(n < 0 or n > den for n in nums):
-        raise ValueError("invalid fill-fraction vector")
-    if settle_lag < 1:
-        raise ValueError("settle_lag must be >= 1: T+0 would invalidate this model")
-    pos = dict(base.positions)
-    cash = base.cash_settled
-    recv = base.receivable_total()
-    for o, num in zip(orders, nums):
-        q = o.remaining * num // den
-        if q == 0:
-            continue
-        if o.price <= 0 or o.cost_bps < 0:
-            raise ValueError("invalid working order economics")
-        notional = q * o.price
-        cost = ceil_bps(notional, o.cost_bps)
         if o.side == "BUY":
-            pos[o.symbol] = pos.get(o.symbol, 0) + q
-            cash -= notional + cost
-        elif o.side == "SELL":
-            if q > pos.get(o.symbol, 0):
-                raise ValueError("reachable fill creates short position")
-            pos[o.symbol] = pos.get(o.symbol, 0) - q
-            recv += notional - cost
+            self.ledger.state.positions[o.symbol] = \
+                self.ledger.state.positions.get(o.symbol, 0) + dq
+            self.ledger.state.cash_settled -= delta_notional + delta_cost
+            if self.ledger.state.cash_settled < 0:
+                self.latch_divergence("SETTLED_CASH_NEGATIVE")
         else:
-            raise ValueError("unknown order side")
-    if any(s not in base.marks for s, q in pos.items() if q):
-        raise ValueError("missing mark for nonzero position")
-    nav = cash + recv + sum(q * base.marks[s] for s, q in pos.items() if q)
-    return SimState(pos, cash, recv, nav, dict(base.marks))
+            have = self.ledger.state.positions.get(o.symbol, 0)
+            if dq > have:
+                self.latch_divergence("FILL_WOULD_CREATE_SHORT")
+                raise Reject("FILL_WOULD_CREATE_SHORT")
+            self.ledger.state.positions[o.symbol] = have - dq
+            net = delta_notional - delta_cost
+            if net > 0:
+                self.ledger.record_sell_receivable(
+                    self.ledger.state.trade_date, net, self.cfg.mandate.settle_lag_days)
+            elif net == 0:
+                self.log.append("ZERO_NET_SALE_PROCEEDS",
+                                {"order_id": order_id,
+                                 "delta_notional": delta_notional,
+                                 "delta_cost": delta_cost},
+                                self.clock.next())
+            else:
+                self.latch_divergence("NEGATIVE_NET_SALE_PROCEEDS")
 
+        self._replace_order(
+            order_id, cum_filled=cum,
+            status="FILLED" if cum == o.qty else "PARTIALLY_FILLED",
+            filled_notional=o.filled_notional + delta_notional,
+            filled_cost=o.filled_cost + delta_cost)
+        self.ledger.mark_peak()
 
-def vertices(m: int):
-    if m < 0:
-        raise ValueError("negative order count")
-    return itertools.product((0, 1), repeat=m)
-
-
-def scenario_nav(sim: SimState, marks: dict[str, int]) -> Money:
-    if any(s not in marks for s, q in sim.positions.items() if q):
-        raise ValueError("scenario missing a held instrument mark")
-    return sim.cash_settled + sim.receivable_total + sum(
-        q * marks[s] for s, q in sim.positions.items() if q)
-
-
-@dataclass(frozen=True)
-class Usage:
-    gross: Money
-    issuer_max: Money
-    factor_abs: Money
-    worst_loss: Money
-    cvar: Money
-    neg_cash: Money
-
-
-def usage(sim: SimState, base_nav: Money, instruments: dict[str, Instrument],
-          scenarios: tuple[dict[str, int], ...], q_bps: int) -> Usage:
-    if not scenarios:
-        raise ValueError("at least one stress scenario is required")
-    if not 1 <= q_bps <= BPS:
-        raise ValueError("CVaR tail fraction must be in (0, 10000] bps")
-    gross = 0
-    issuer: dict[str, int] = {}
-    factor = 0
-    for sym, q in sim.positions.items():
-        if q == 0:
-            continue
-        if sym not in instruments or sym not in sim.marks:
-            raise ValueError(f"missing instrument or mark: {sym}")
-        inst = instruments[sym]
-        val = q * sim.marks[sym]
-        gross += abs(val)
-        for iss, w in inst.lookthrough():
-            issuer[iss] = issuer.get(iss, 0) + ceil_bps(abs(val), w)
-        factor += inst.beta_bps * val
-    losses = sorted((base_nav - scenario_nav(sim, sc) for sc in scenarios), reverse=True)
-    k = max(1, (len(losses) * q_bps + BPS - 1) // BPS)
-    k = min(k, len(losses))
-    cvar = sum(losses[:k]) // k
-    return Usage(gross, max(issuer.values(), default=0), abs(factor) // BPS,
-                 max(losses), cvar, max(0, -sim.cash_settled))
-
-
-def set_marks(_marks: dict[str, Money]) -> None:
-    """Deprecated compatibility shim. Marks belong to each SimState."""
-    return None
-
-
-CONSTRAINTS = ("gross", "issuer_max", "factor_abs", "worst_loss", "cvar", "neg_cash")
-LOSS_CONSTRAINTS = frozenset({"worst_loss", "cvar"})
-
-
-def is_risk_reducing(worst: dict[str, int], base: dict[str, int]) -> bool:
-    """True when no constraint usage increases. Loss metrics floored at 0.
-
-    Retained for diagnostics and the Evaluation.risk_reducing field.
-    The evaluate() exemption below is per-constraint, not all-or-nothing.
-    """
-    for c in CONSTRAINTS:
-        w, b = worst[c], base[c]
-        if c in LOSS_CONSTRAINTS:
-            w, b = max(0, w), max(0, b)
-        if w > b:
+    def _reconcile_snapshot(self) -> bool:
+        snap = self.venue.snapshot()
+        if snap is None or not snap.get("complete", False):
+            self.flags.exec = "DISCONNECTED"
             return False
-    return True
 
+        ledger_cash_equivalent = (self.ledger.state.cash_settled
+                                  + self.ledger.state.receivable_total())
+        if snap["positions"] != self.ledger.state.positions or \
+                snap["cash"] != ledger_cash_equivalent:
+            self.latch_divergence("CASH_OR_POSITION_MISMATCH")
+            return False
 
-@dataclass(frozen=True)
-class Evaluation:
-    ok: bool
-    reason: str
-    max_usage: dict[str, int]
-    base_usage: dict[str, int]
-    nav_min: Money
-    risk_reducing: bool
-    n_vertices: int
-
-
-def evaluate(base: VerifiedState, orders: tuple[WorkingOrder, ...],
-             instruments: dict[str, Instrument], mandate: Mandate,
-             scenarios: tuple[dict[str, int], ...],
-             *, m_vertex: int = 6) -> Evaluation:
-    m = len(orders)
-    if m > m_vertex:
-        return Evaluation(False, "M_VERTEX_EXCEEDED", {}, {}, 0, False, 0)
-    if not scenarios:
-        return Evaluation(False, "NO_STRESS_SCENARIOS", {}, {}, 0, False, 0)
-    try:
-        nav0 = base.nav()
-        base_sim = simulate(base, orders, (0,) * m, 1, instruments, mandate.settle_lag_days)
-        bu = usage(base_sim, nav0, instruments, scenarios, mandate.cvar_q_bps)
-        base_d = {c: getattr(bu, c) for c in CONSTRAINTS}
-        max_d = {c: -10**30 for c in CONSTRAINTS}
-        nav_min = 10**30
-        n = 0
-        for v in vertices(m):
-            n += 1
-            sim = simulate(base, orders, v, 1, instruments, mandate.settle_lag_days)
-            # HARD FLOORS: never exempted, even for risk-reducing trades.
-            if any(q < 0 for q in sim.positions.values()):
-                return Evaluation(False, "SHORT_REACHABLE", {}, {}, 0, False, n)
-            if sim.cash_settled < 0:
-                return Evaluation(False, "SETTLED_CASH_NEGATIVE", {}, {}, 0, False, n)
-            nav_min = min(nav_min, sim.nav)
-            u = usage(sim, nav0, instruments, scenarios, mandate.cvar_q_bps)
-            for c in CONSTRAINTS:
-                max_d[c] = max(max_d[c], getattr(u, c))
-        if nav_min <= 0:
-            return Evaluation(False, "NAV_NONPOSITIVE", max_d, base_d, nav_min, False, n)
-
-        reducing = is_risk_reducing(max_d, base_d)
-
-        checks = (
-            ("gross", max_d["gross"], floor_bps(nav_min, mandate.gross_bps), "GROSS"),
-            ("issuer_max", max_d["issuer_max"], floor_bps(nav_min, mandate.issuer_bps), "ISSUER"),
-            ("factor_abs", max_d["factor_abs"], floor_bps(nav_min, mandate.factor_bps), "FACTOR"),
-            ("worst_loss", max_d["worst_loss"], floor_bps(nav0, mandate.worst_loss_bps), "WORST_LOSS"),
-            ("cvar", max_d["cvar"], floor_bps(nav0, mandate.cvar_bps), "CVAR"),
-        )
-
-        # 1. Any NEW breach rejects immediately, regardless of other dimensions.
-        for c, got, lim, name in checks:
-            if got > lim and base_d[c] <= lim:
-                return Evaluation(False, f"LIMIT_{name}", max_d, base_d, nav_min, False, n)
-
-        # 2. Pre-existing breaches may be waived only if not worsening.
-        for c, got, lim, name in checks:
-            if got > lim:
-                w, b = max_d[c], base_d[c]
-                if c in LOSS_CONSTRAINTS:
-                    w, b = max(0, w), max(0, b)
-                if w > b:
-                    return Evaluation(False, f"LIMIT_{name}", max_d, base_d, nav_min, False, n)
-                # Pre-existing breach, worst reachable usage did not worsen: waive.
+        for o in self.ledger.state.working:
+            if o.status in LEDGER_ONLY:
                 continue
+            vo = snap["orders"].get(o.order_id)
+            if vo is None:
+                if not o.terminal:
+                    self.latch_divergence("MISSING_VENUE_ORDER")
+                    return False
+                continue
+            if vo["qty"] != o.qty or vo["symbol"] != o.symbol or vo["side"] != o.side:
+                self.latch_divergence("ORDER_TERMS_MISMATCH")
+                return False
+            if vo["cum_qty"] < o.cum_filled or vo["cum_qty"] > o.qty:
+                self.latch_divergence("VENUE_CUM_OUT_OF_RANGE")
+                return False
+            if vo["cum_qty"] > o.cum_filled:
+                dn = vo["filled_notional"] - o.filled_notional
+                dc = vo["filled_cost"] - o.filled_cost
+                dq = vo["cum_qty"] - o.cum_filled
+                if dn <= 0 or dc < 0 or dn < dq:
+                    self.latch_divergence("INVALID_VENUE_NOTIONAL")
+                    return False
+                self._apply_snapshot_fill(o.order_id, vo["cum_qty"], dn, dc)
+                o = self._find(o.order_id)
+            if vo["filled_notional"] != o.filled_notional or vo["filled_cost"] != o.filled_cost:
+                self.latch_divergence("NOTIONAL_COST_MISMATCH")
+                return False
+            if o.status == "UNKNOWN" or vo["status"] == "UNKNOWN":
+                self.flags.exec = "DIVERGENT"
+                return False
+            if o.terminal:
+                if vo["status"] != o.status:
+                    self.latch_divergence("TERMINAL_STATUS_MISMATCH")
+                    return False
+            elif vo["status"] in TERMINAL_VENUE:
+                self._replace_order(o.order_id, status=vo["status"])
 
-        return Evaluation(True, "OK", max_d, base_d, nav_min, reducing, n)
-    except (ValueError, KeyError, ZeroDivisionError) as exc:
-        return Evaluation(False, f"INVALID_RISK_INPUT:{type(exc).__name__}", {}, {}, 0, False, 0)
+        self.flags.exec = "DIVERGENT" if self._divergence_latched else "OK"
+        return not self._divergence_latched
 
+    def _recompute(self) -> None:
+        active = self.ledger.working_active()
+        if not active:
+            self.ledger.reserved = {c: 0 for c in CONSTRAINTS}
+            if self.flags.envelope == "OVERFLOW":
+                self.flags.envelope = "OK"
+            return
+        ev = evaluate(self.ledger.state, active, self.instruments, self.cfg.mandate,
+                      self.scenarios, m_vertex=self.cfg.ops.m_vertex)
+        if not ev.ok:
+            self.flags.envelope = "OVERFLOW"
+            self.log.append("OVERFLOW", {"reason": ev.reason}, self.clock.next())
+            return
+        self.ledger.reserved = reservations(ev)
+        if self.flags.envelope == "OVERFLOW":
+            self.flags.envelope = "OK"
 
-def reservations(ev: Evaluation) -> dict[str, int]:
-    if not ev.ok:
-        raise ValueError("cannot reserve against a failed risk evaluation")
-    return {c: max(0, ev.max_usage[c] - ev.base_usage[c]) for c in CONSTRAINTS}
+    def recover(self) -> str:
+        with self.lock:
+            snap = self.venue.snapshot()
+            if snap is None or not snap.get("complete", False):
+                self.flags.exec = "DISCONNECTED"
+                self._persist()
+                return "BLOCKED_NO_AUTHORITATIVE_SNAPSHOT"
+            unresolved = False
+            for o in self.ledger.state.working:
+                if o.status in LEDGER_ONLY:
+                    continue
+                vo = snap["orders"].get(o.order_id)
+                if vo is None:
+                    if not o.terminal:
+                        unresolved = True
+                    continue
+                if vo["cum_qty"] != o.cum_filled:
+                    unresolved = True
+                    continue
+                if (vo["qty"], vo["symbol"], vo["side"]) != (o.qty, o.symbol, o.side):
+                    unresolved = True
+                    continue
+                if vo["status"] == "UNKNOWN" or o.status == "UNKNOWN":
+                    unresolved = True
+                    continue
+                if vo["status"] in TERMINAL_VENUE:
+                    self._replace_order(o.order_id, status=vo["status"])
+                elif not o.terminal:
+                    self._replace_order(o.order_id, status=vo["status"])
+            ok = self._reconcile_snapshot()
+            if unresolved or not ok:
+                self.flags.exec = "DIVERGENT"
+                self._recompute()
+                self._persist()
+                return "BLOCKED_UNRESOLVED"
+            self._recompute()
+            self._persist()
+            return "RECOVERED"

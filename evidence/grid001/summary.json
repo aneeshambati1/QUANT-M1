@@ -1,0 +1,127 @@
+{
+  "family": "momentum",
+  "hypothesis": "cross-sectional trailing return predicts forward return",
+  "grid_lookbacks": [
+    5,
+    10,
+    63
+  ],
+  "grid_horizons": [
+    1,
+    5,
+    10,
+    21
+  ],
+  "n_trials_total": 13,
+  "required_abs_t": 2.8905115606917393,
+  "survivors": [],
+  "cells": [
+    {
+      "trial_id": "grid001_lb10_hz1",
+      "lookback": 10,
+      "horizon": 1,
+      "mean_ic": -0.013803706642832826,
+      "t_hac": -1.5122886518378431,
+      "passed": false
+    },
+    {
+      "trial_id": "grid001_lb5_hz1",
+      "lookback": 5,
+      "horizon": 1,
+      "mean_ic": -0.012861397914941395,
+      "t_hac": -1.4839224131337723,
+      "passed": false
+    },
+    {
+      "trial_id": "grid001_lb63_hz1",
+      "lookback": 63,
+      "horizon": 1,
+      "mean_ic": 0.009992943806793966,
+      "t_hac": 1.1407655572099291,
+      "passed": false
+    },
+    {
+      "trial_id": "grid001_lb63_hz5",
+      "lookback": 63,
+      "horizon": 5,
+      "mean_ic": 0.01644318329198184,
+      "t_hac": 0.9614527602351879,
+      "passed": false
+    },
+    {
+      "trial_id": "grid001_lb5_hz5",
+      "lookback": 5,
+      "horizon": 5,
+      "mean_ic": -0.012391440370903955,
+      "t_hac": -0.8451656470109946,
+      "passed": false
+    },
+    {
+      "trial_id": "grid001_lb10_hz10",
+      "lookback": 10,
+      "horizon": 10,
+      "mean_ic": 0.010081585081585081,
+      "t_hac": 0.5609891081708356,
+      "passed": false
+    },
+    {
+      "trial_id": "grid001_lb10_hz21",
+      "lookback": 10,
+      "horizon": 21,
+      "mean_ic": 0.011596853850374978,
+      "t_hac": 0.558950092991507,
+      "passed": false
+    },
+    {
+      "trial_id": "grid001_lb63_hz10",
+      "lookback": 63,
+      "horizon": 10,
+      "mean_ic": 0.004914474255448479,
+      "t_hac": 0.229562723675565,
+      "passed": false
+    },
+    {
+      "trial_id": "grid001_lb63_hz21",
+      "lookback": 63,
+      "horizon": 21,
+      "mean_ic": -0.001789274322169059,
+      "t_hac": -0.07297633058694881,
+      "passed": false
+    },
+    {
+      "trial_id": "grid001_lb5_hz21",
+      "lookback": 5,
+      "horizon": 21,
+      "mean_ic": 0.0008595462934714349,
+      "t_hac": 0.05058487315124403,
+      "passed": false
+    },
+    {
+      "trial_id": "grid001_lb10_hz5",
+      "lookback": 10,
+      "horizon": 5,
+      "mean_ic": -0.0006461065753338201,
+      "t_hac": -0.041245525036408805,
+      "passed": false
+    },
+    {
+      "trial_id": "grid001_lb5_hz10",
+      "lookback": 5,
+      "horizon": 10,
+      "mean_ic": 0.0005716010771542012,
+      "t_hac": 0.03693298952890076,
+      "passed": false
+    }
+  ],
+  "panel": {
+    "source": "yfinance",
+    "vintage": "downloaded:2026-11-25T12:25:13.509683+00:00",
+    "pit": false,
+    "label": "PROVISIONAL - yfinance back-adjusted, NON-PIT, gross of cost",
+    "n_rows": 2516,
+    "n_symbols": 10,
+    "start": "2015-01-02 00:00:00+00:00",
+    "end": "2024-12-31 00:00:00+00:00"
+  },
+  "label": "PROVISIONAL - NON-PIT - gross of cost - NOT AN EDGE CLAIM"
+}

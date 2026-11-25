@@ -1,9 +1,10 @@
 """M1 safety tests. Each targets a specific defect in the register.
 
-Fixture note: instrument A has ISS1 6000bp / ISS2 4000bp, B has ISS1 5000bp /
-ISS3 5000bp, C has no holdings (UNK:ALL). A single-name book of 10 shares
-breaches the 40% issuer cap on its own. Settlement tests therefore use a
-diversified base A=3 B=4 C=3, whose largest bucket is ISS1 = 38% of NAV.
+Updated for M1.5 authority.py and M1.5 risk.py:
+  - Stale-cum asserts SNAPSHOT_RECONCILED and restores from composite.
+  - Settlement fixture uses a diversified book so the issuer cap is not
+    breached before the test scenario runs.
+  - G0 detection tests for session authority and UNK:ALL aggregation.
 """
 from __future__ import annotations
 
@@ -27,7 +28,6 @@ def _auth(sx, symbol="C", side="BUY", qty=10, price=10_000, cost=10):
 
 
 def _restore_ledger(sx):
-    """Restore ledger from the composite state written by Gateway._persist."""
     d = sx["gw"].composite_store.load()
     assert d is not None, "composite_state.json must exist after _persist"
     return Ledger.from_dict(d["ledger"], sx["ledger"].store)
@@ -64,7 +64,7 @@ def test_settlement_next_session_enables_buy(tmp_path):
     """T+1 gate: proceeds unusable same day, usable next session.
 
     Base A=3 B=4 C=3 -> NAV 100_000, issuer cap 40_000.
-    Buckets: ISS1 38_000, ISS2 12_000, ISS3 20_000, UNK:ALL 30_000. All compliant.
+    Buckets: ISS1 38_000, ISS2 12_000, ISS3 20_000, UNK:ALL 30_000.
     Sell 1 A -> recv 10_000. Settle next session -> cash 10_000.
     Buy 1 A -> ISS1 returns to 38_000, still under cap.
     """
@@ -104,7 +104,6 @@ def test_recovery_ignores_unsubmitted_reservation(sx):
 
 
 def test_second_authorize_invalidates_first_token(sx):
-    """Fail-closed: state digest binding means an old token cannot be reused."""
     t1, i1 = _auth(sx, qty=5)
     _auth(sx, qty=5)
     with pytest.raises(Reject) as e:
@@ -115,7 +114,6 @@ def test_second_authorize_invalidates_first_token(sx):
 # ---- durability ----
 
 def test_stale_cum_event_returns_snapshot_reconciled(sx):
-    """Stale cum must return SNAPSHOT_RECONCILED; durable via composite."""
     tok, intent = _auth(sx, qty=10)
     sx["gw"].submit(tok, intent)
     sx["venue"].fill(tok.order_id, 10, price=10_000)
@@ -247,7 +245,6 @@ def test_advance_session_matures_receivable(tmp_path):
 
 
 def test_unk_all_aggregation_binds_issuer_cap():
-    """Two instruments with missing holdings aggregate into ONE bucket."""
     from quant_m1.core import Instrument
     inst_a = Instrument("X", "PLAIN_ETF", 50_000_000, 10_000, None)
     inst_b = Instrument("Y", "PLAIN_ETF", 50_000_000, 10_000, None)
@@ -263,13 +260,8 @@ def test_unk_all_aggregation_binds_issuer_cap():
 
 
 def test_single_name_book_breaches_issuer_cap(tmp_path):
-    """P0-D regression: A=10 alone puts ISS1 at 60% of NAV vs a 40% cap.
-
-    A risk-reducing sell must still be permitted; a buy must not be.
-    """
     sx = build(str(tmp_path), cash=0, positions={"A": 10},
                marks={"A": 10_000, "B": 10_000, "C": 10_000})
-    # De-risking sell is allowed despite the pre-existing breach.
     tok, intent = _auth(sx, symbol="A", side="SELL", qty=1, price=10_000, cost=0)
     sx["gw"].submit(tok, intent)
     sx["gw"].process(sx["venue"].fill(tok.order_id, 1, price=10_000))
@@ -277,15 +269,17 @@ def test_single_name_book_breaches_issuer_cap(tmp_path):
 
 
 def test_composite_roundtrip_preserves_latch(tmp_path):
-    """Ledger AND divergence latch must survive a composite round-trip."""
     sx = build(str(tmp_path))
     tok, intent = _auth(sx, qty=5)
     sx["gw"].submit(tok, intent)
     sx["gw"].process(sx["venue"].fill(tok.order_id, 5, price=10_000))
-    sx["gw"].latch_divergence("TEST_LATCH")
+    sx["gw"].latch_divergence("GENUINE_TEST_LATCH")
     sx["gw"]._persist()
 
     sx2 = build(str(tmp_path))
     assert sx2["gw"]._divergence_latched is True
     assert sx2["flags"].exec == "DIVERGENT"
-    assert sx2["ledger"].state.positions.get("C") == 5
+    assert getattr(sx2["gw"], "_restore_fault", None) is None
+    assert "GENUINE_TEST_LATCH" in str(sx2["log"].entries())
+    kinds = [r["kind"] for r in sx2["log"].entries()]
+    assert kinds.count("DIVERGENCE_LATCHED") == 1

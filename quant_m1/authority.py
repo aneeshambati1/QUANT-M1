@@ -1,27 +1,28 @@
 """M1.5 authorization kernel and execution gateway.
 
 Changes over M1.4:
-  - RED-TEAM Q: submit() re-checks NEW_RISK for BUY and re-checks mark staleness.
-    A token authorized under permissive flags must not transmit after flags revoke
-    new risk. Flags are not part of VerifiedState.digest(), so the token alone
-    cannot enforce this.
-  - RED-TEAM S: restore_flags() restores and verifies the EventLog BEFORE comparing
-    audit heads. A missing/short chain no longer truncates the audit file.
-  - RED-TEAM S: audit-head comparison uses chain membership, not equality. The log
-    may legitimately be AHEAD of the composite (persist-then-append window); only a
-    log that has LOST a recorded event is a divergence.
-  - RED-TEAM S: mismatch paths no longer overwrite the composite. Evidence is
-    preserved for operator inspection.
-  - Composite atomic persistence, stale-o refresh, submit rollback, nonpositive
-    sale proceeds handling retained from M1.4.
+  - RED-TEAM Q: submit() re-checks NEW_RISK for BUY and re-checks mark
+    staleness at transmission time. A token authorized under permissive flags
+    must not transmit after flags revoke new risk.
+  - RED-TEAM S: restore_flags() restores and verifies the EventLog BEFORE
+    comparing audit heads. A missing or short chain no longer truncates the
+    audit file.
+  - RED-TEAM S: audit-head comparison uses chain membership, not equality.
+    The log may legitimately be AHEAD of the composite (persist-then-append
+    window); only a log that has LOST a recorded event is a divergence.
+  - RED-TEAM S: mismatch paths no longer overwrite the composite. Evidence
+    is preserved for operator inspection.
+  - Composite atomic persistence, stale-o refresh, submit rollback,
+    nonpositive sale proceeds handling retained from M1.4.
 
 PRESERVED VERBATIM: CRASH_A / CRASH_B, RESERVATION_INTENT_MISMATCH,
-_replace_order raising UNKNOWN_ORDER, Kernel.authorize persisting before return,
-LEDGER_ONLY skip, sticky latch, all execution-path methods.
+_replace_order raising UNKNOWN_ORDER, Kernel.authorize persisting before
+return, LEDGER_ONLY skip, sticky latch, all execution-path methods.
 
 DEFERRED (requires Token schema change + full test review):
   - RED-TEAM R: operational-config version is not bound into the token.
-  - RED-TEAM H: ledger control state (nonces, submit_seq, reserved) is not bound.
+  - RED-TEAM H: ledger control state (nonces, submit_seq, reserved) is not
+    bound into the token digest.
 """
 from __future__ import annotations
 
@@ -203,8 +204,7 @@ class Gateway:
         self.flags_store = flags_store or Store(os.path.join(base_dir, "flags.json"))
         self.composite_store = Store(os.path.join(base_dir, "composite_state.json"))
         self._divergence_latched = False
-
-    # ---- durable composite write: ledger + flags + latch + audit head ----
+        self._restore_fault = None
 
     def _persist(self) -> None:
         payload = {
@@ -218,11 +218,10 @@ class Gateway:
         self.composite_store.save(payload)
 
     def _latch_silent(self, reason: str) -> None:
-        """Latch WITHOUT appending to the audit chain and WITHOUT persisting.
+        """Latch WITHOUT appending to audit and WITHOUT persisting.
 
         Used on restore failures, where appending would overwrite the very
-        evidence that failed verification. The reason is surfaced via flags.exec
-        and must be inspected by an operator against the on-disk artifacts.
+        evidence that failed verification.
         """
         self._divergence_latched = True
         self.flags.exec = "DIVERGENT"
@@ -357,16 +356,14 @@ class Gateway:
             if self._watchdog():
                 raise Reject("WATCHDOG_STOP")
 
-            # RED-TEAM Q: re-check the FULL permission set at transmission time.
-            # Flags are not bound into VerifiedState.digest(), so a token issued
-            # under permissive flags would otherwise survive a NEW_RISK revoke.
+            # RED-TEAM Q: re-check the FULL permission set at transmission.
             perms = self.flags.permissions()
             if "SUBMIT" not in perms:
                 raise Reject("MODE_BLOCKS_SUBMIT")
             if intent.side == "BUY" and "NEW_RISK" not in perms:
                 raise Reject("MODE_BLOCKS_NEW_RISK")
 
-            # RED-TEAM Q: re-check data freshness at transmission time.
+            # RED-TEAM Q: re-check data freshness at transmission.
             if (self.clock.wall < self.ledger.state.mark_wall or
                     self.clock.wall - self.ledger.state.mark_wall
                     > self.cfg.mandate.tau_data_secs):

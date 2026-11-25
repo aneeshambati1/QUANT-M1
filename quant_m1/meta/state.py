@@ -21,7 +21,6 @@ class Regime(Enum):
 
 # ASSUMPTION: these thresholds are POLICY choices, taken from the dossier's
 # correlation ladder (Part 4.6). They are not measured calibration.
-#   calm 0.436 -> N_eff 2.23 ; crisis 0.85 -> N_eff 1.17
 CORR_ELEVATED = 0.60
 CORR_RISK_OFF = 0.75
 CORR_CRISIS = 0.85
@@ -115,10 +114,15 @@ class MarketState:
 
     @property
     def data_unknown(self) -> bool:
-        """Any core observation missing means the world is not known."""
-        return (self.avg_corr is None
-                or self.vol_ann is None
-                or self.liquidity_score is None)
+        """Volatility and liquidity are required for any allocation decision.
+
+        Correlation is regime-classification input, not a gating observation.
+        A state with known vol/liquidity but unknown correlation reaches R9
+        (REGIME_UNKNOWN) rather than being blocked at R2. This preserves the
+        policy's ability to distinguish 'world partially observed' from
+        'world unobserved'.
+        """
+        return self.vol_ann is None or self.liquidity_score is None
 
     @property
     def data_stale(self) -> bool:
@@ -129,7 +133,7 @@ class MarketState:
     @property
     def liquidity_shock(self) -> bool:
         if self.liquidity_score is None:
-            return False  # handled by data_unknown, not double-counted
+            return False
         return self.liquidity_score < LIQUIDITY_SHOCK
 
     @property

@@ -1,9 +1,9 @@
 """M1 safety tests. Each targets a specific defect in the register.
 
-Updated for M1.5 core/risk/authority:
-  - Stale-cum asserts SNAPSHOT_RECONCILED and restores from composite.
-  - Settlement fixture uses cash=0 so ledger and venue start consistent.
-  - G0 detection tests for session authority and UNK:ALL aggregation.
+Fixture note: instrument A has ISS1 6000bp / ISS2 4000bp, B has ISS1 5000bp /
+ISS3 5000bp, C has no holdings (UNK:ALL). A single-name book of 10 shares
+breaches the 40% issuer cap on its own. Settlement tests therefore use a
+diversified base A=3 B=4 C=3, whose largest bucket is ISS1 = 38% of NAV.
 """
 from __future__ import annotations
 
@@ -48,33 +48,27 @@ def test_sell_fill_reconciles_with_t0_venue_cash(sx):
 
 
 def test_sell_proceeds_cannot_fund_same_day_buy(tmp_path):
-    sx = build(str(tmp_path), cash=0, positions={"A": 10},
+    sx = build(str(tmp_path), cash=0, positions={"A": 3, "B": 4, "C": 3},
                marks={"A": 10_000, "B": 10_000, "C": 10_000})
-    tok, intent = _auth(sx, symbol="A", side="SELL", qty=10, price=10_000, cost=0)
+    tok, intent = _auth(sx, symbol="A", side="SELL", qty=1, price=10_000, cost=0)
     sx["gw"].submit(tok, intent)
-    sx["gw"].process(sx["venue"].fill(tok.order_id, 10, price=10_000))
+    sx["gw"].process(sx["venue"].fill(tok.order_id, 1, price=10_000))
     assert sx["ledger"].state.cash_settled == 0
-    assert sx["ledger"].state.cash_unsettled == 100_000
+    assert sx["ledger"].state.cash_unsettled == 10_000
     with pytest.raises(Reject) as e:
-        _auth(sx, symbol="C", side="BUY", qty=10, price=10_000, cost=0)
+        _auth(sx, symbol="A", side="BUY", qty=1, price=10_000, cost=0)
     assert e.value.code == "SETTLED_CASH_NEGATIVE"
 
 
 def test_settlement_next_session_enables_buy(tmp_path):
     """T+1 gate: proceeds unusable same day, usable next session.
 
-    cash=0 keeps ledger and venue consistent from construction.
-    1 share at 10_000 cents = 10_000 notional, NAV = 10_000.
-    Issuer cap = floor_bps(10_000, 4_000) = 4_000.
-    Post-buy UNK:ALL = 10_000 would breach, so we buy symbol A instead,
-    whose ISS1/ISS2 split keeps each bucket at 6_000/4_000... still over.
-
-    Correct approach: size NAV large enough that the traded notional fits
-    inside the issuer cap, while keeping settled cash at zero pre-settlement.
-    Use cash=0, positions A=10 (NAV=100_000, cap=40_000), sell 1 (10_000),
-    then buy 1 of A (ISS1 6_000, ISS2 4_000) -> both under 40_000.
+    Base A=3 B=4 C=3 -> NAV 100_000, issuer cap 40_000.
+    Buckets: ISS1 38_000, ISS2 12_000, ISS3 20_000, UNK:ALL 30_000. All compliant.
+    Sell 1 A -> recv 10_000. Settle next session -> cash 10_000.
+    Buy 1 A -> ISS1 returns to 38_000, still under cap.
     """
-    sx = build(str(tmp_path), cash=0, positions={"A": 10},
+    sx = build(str(tmp_path), cash=0, positions={"A": 3, "B": 4, "C": 3},
                marks={"A": 10_000, "B": 10_000, "C": 10_000})
     tok, intent = _auth(sx, symbol="A", side="SELL", qty=1, price=10_000, cost=0)
     sx["gw"].submit(tok, intent)
@@ -87,7 +81,6 @@ def test_settlement_next_session_enables_buy(tmp_path):
     assert sx["ledger"].settle(d + 1) == 10_000
     sx["ledger"].state.trade_date = d + 1
     sx["ledger"].persist()
-    # Buy A, not C: A has known holdings, so no UNK:ALL concentration.
     _auth(sx, symbol="A", side="BUY", qty=1, price=10_000, cost=0)
 
 
@@ -239,7 +232,7 @@ def test_session_regression_rejected(tmp_path):
 
 
 def test_advance_session_matures_receivable(tmp_path):
-    sx = build(str(tmp_path), cash=0, positions={"A": 10},
+    sx = build(str(tmp_path), cash=0, positions={"A": 3, "B": 4, "C": 3},
                marks={"A": 10_000, "B": 10_000, "C": 10_000})
     tok, intent = _auth(sx, symbol="A", side="SELL", qty=1, price=10_000, cost=0)
     sx["gw"].submit(tok, intent)
@@ -267,6 +260,20 @@ def test_unk_all_aggregation_binds_issuer_cap():
         combined[iss] = combined.get(iss, 0) + ceil_bps(3_500_000, w)
     assert combined["UNK:ALL"] == 7_000_000
     assert combined["UNK:ALL"] > 4_000_000
+
+
+def test_single_name_book_breaches_issuer_cap(tmp_path):
+    """P0-D regression: A=10 alone puts ISS1 at 60% of NAV vs a 40% cap.
+
+    A risk-reducing sell must still be permitted; a buy must not be.
+    """
+    sx = build(str(tmp_path), cash=0, positions={"A": 10},
+               marks={"A": 10_000, "B": 10_000, "C": 10_000})
+    # De-risking sell is allowed despite the pre-existing breach.
+    tok, intent = _auth(sx, symbol="A", side="SELL", qty=1, price=10_000, cost=0)
+    sx["gw"].submit(tok, intent)
+    sx["gw"].process(sx["venue"].fill(tok.order_id, 1, price=10_000))
+    assert sx["ledger"].state.positions["A"] == 9
 
 
 def test_composite_roundtrip_preserves_latch(tmp_path):

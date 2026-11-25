@@ -1,7 +1,4 @@
-import os, sys, subprocess, ast
-os.chdir("/content/QUANT-M1")
-
-T = r'''"""Governor tests: tamper evidence, pre-registration, and trial-count gate."""
+"""Governor tests: tamper evidence, pre-registration, and trial-count gate."""
 from __future__ import annotations
 
 import json
@@ -132,24 +129,3 @@ def test_invalid_gate_inputs(tmp_path):
         bonferroni_threshold(0)
     with pytest.raises(LedgerError):
         bonferroni_threshold(1, alpha=0.0)
-'''
-
-open("tests/test_governor.py", "w").write(T)
-ast.parse(T)
-c = open("tests/test_governor.py").read()
-print("bytes:", len(c))
-print("test count:", c.count("\ndef test_"))
-print("has monkeypatch:", "monkeypatch.setattr(governor" in c)
-assert "monkeypatch.setattr(governor" in c, "WRITE FAILED"
-
-def run(a, l):
-    print("\n" + "="*60); print(l); print("="*60)
-    p = subprocess.run([sys.executable,"-m","pytest"]+a, capture_output=True, text=True)
-    print("RC:", p.returncode); print(p.stdout or "(empty)")
-    if p.stderr: print("STDERR:", p.stderr)
-    return p
-
-p1 = run(["tests/test_governor.py","-q","--tb=short"], "PHASE 1 governor")
-if p1.returncode == 0:
-    run(["tests/","-q","--tb=short"], "PHASE 2 full suite")
-print("\nNOT PUSHED.")

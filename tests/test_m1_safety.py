@@ -1,17 +1,16 @@
 """M1 safety tests. Each targets a specific defect in the register.
 
-Updated for M1.5 authority.py and M1.5 risk.py:
-  - Stale-cum test asserts SNAPSHOT_RECONCILED (not APPLIED).
-  - Settlement test compatible with monotonic settle guard.
-  - Flags restart test compatible with composite persistence.
-  - Added G0 detection tests for per-constraint exemption and UNK:ALL.
+Updated for M1.5 core/risk/authority:
+  - Stale-cum asserts SNAPSHOT_RECONCILED and restores from composite.
+  - Settlement fixture sized so the post-trade book is issuer-compliant.
+  - G0 detection tests for session authority and UNK:ALL aggregation.
 """
 from __future__ import annotations
 
 import pytest
 
 from quant_m1.authority import Intent, Reject
-from quant_m1.core import Ledger, InvariantError, ceil_bps
+from quant_m1.core import Ledger, ceil_bps
 from quant_m1.system import build
 from quant_m1.venue import ExecEvent
 
@@ -25,6 +24,13 @@ def _auth(sx, symbol="C", side="BUY", qty=10, price=10_000, cost=10):
     intent = Intent(symbol, side, qty, price, cost)
     tok = sx["kernel"].authorize(sx["ledger"], intent, sx["flags"], sx["clock"], False)
     return tok, intent
+
+
+def _restore_ledger(sx):
+    """Restore ledger from the composite state file written by Gateway._persist."""
+    d = sx["gw"].composite_store.load()
+    assert d is not None, "composite_state.json must exist after _persist"
+    return Ledger.from_dict(d["ledger"], sx["ledger"].store)
 
 
 # ---- T+1 ----
@@ -55,19 +61,29 @@ def test_sell_proceeds_cannot_fund_same_day_buy(tmp_path):
 
 
 def test_settlement_next_session_enables_buy(tmp_path):
-    sx = build(str(tmp_path), cash=0, positions={"A": 10},
+    """T+1 gate: sell proceeds unusable same day, usable next session.
+
+    Fixture sized so the traded notional stays inside the issuer cap:
+    NAV = 100_000, issuer cap = 40_000, trade notional = 10_000.
+    """
+    sx = build(str(tmp_path), cash=90_000, positions={"A": 1},
                marks={"A": 10_000, "B": 10_000, "C": 10_000})
-    tok, intent = _auth(sx, symbol="A", side="SELL", qty=10, price=10_000, cost=0)
+    # Drain settled cash so only the receivable can fund the buy.
+    sx["ledger"].state.cash_settled = 0
+    sx["ledger"].persist()
+
+    tok, intent = _auth(sx, symbol="A", side="SELL", qty=1, price=10_000, cost=0)
     sx["gw"].submit(tok, intent)
-    sx["gw"].process(sx["venue"].fill(tok.order_id, 10, price=10_000))
+    sx["gw"].process(sx["venue"].fill(tok.order_id, 1, price=10_000))
+    assert sx["ledger"].state.cash_settled == 0
+    assert sx["ledger"].state.cash_unsettled == 10_000
+
     d = sx["ledger"].state.trade_date
-    # Monotonic guard: settle(d) sets last_settled_session=d, releases 0.
     assert sx["ledger"].settle(d) == 0
-    # settle(d+1) > last_settled_session, releases matured receivable.
-    assert sx["ledger"].settle(d + 1) == 100_000
+    assert sx["ledger"].settle(d + 1) == 10_000
     sx["ledger"].state.trade_date = d + 1
     sx["ledger"].persist()
-    _auth(sx, symbol="C", side="BUY", qty=10, price=10_000, cost=0)
+    _auth(sx, symbol="C", side="BUY", qty=1, price=10_000, cost=0)
 
 
 # ---- unsubmitted reservations ----
@@ -90,7 +106,6 @@ def test_recovery_ignores_unsubmitted_reservation(sx):
 
 
 def test_second_authorize_invalidates_first_token(sx):
-    """Fail-closed: state digest binding means an old token cannot be reused."""
     t1, i1 = _auth(sx, qty=5)
     _auth(sx, qty=5)
     with pytest.raises(Reject) as e:
@@ -101,7 +116,7 @@ def test_second_authorize_invalidates_first_token(sx):
 # ---- durability ----
 
 def test_stale_cum_event_returns_snapshot_reconciled(sx):
-    """With the stale-o fix, stale cum always returns SNAPSHOT_RECONCILED."""
+    """Stale cum must return SNAPSHOT_RECONCILED; durable via composite."""
     tok, intent = _auth(sx, qty=10)
     sx["gw"].submit(tok, intent)
     sx["venue"].fill(tok.order_id, 10, price=10_000)
@@ -109,7 +124,7 @@ def test_stale_cum_event_returns_snapshot_reconciled(sx):
     result = sx["gw"].process(ev)
     assert result == "SNAPSHOT_RECONCILED"
     assert ev.exec_id in sx["ledger"].applied_exec_ids
-    back = Ledger.restore(sx["ledger"].store)
+    back = _restore_ledger(sx)
     assert back.state.positions["C"] == 10
     assert sx["gw"].process(ev) == "NOOP_DUPLICATE"
 
@@ -218,41 +233,48 @@ def test_session_regression_rejected(tmp_path):
 
 
 def test_advance_session_matures_receivable(tmp_path):
-    sx = build(str(tmp_path), cash=0, positions={"A": 10},
+    sx = build(str(tmp_path), cash=90_000, positions={"A": 1},
                marks={"A": 10_000, "B": 10_000, "C": 10_000})
-    tok, intent = _auth(sx, symbol="A", side="SELL", qty=10, price=10_000, cost=0)
+    sx["ledger"].state.cash_settled = 0
+    sx["ledger"].persist()
+    tok, intent = _auth(sx, symbol="A", side="SELL", qty=1, price=10_000, cost=0)
     sx["gw"].submit(tok, intent)
-    sx["gw"].process(sx["venue"].fill(tok.order_id, 10, price=10_000))
+    sx["gw"].process(sx["venue"].fill(tok.order_id, 1, price=10_000))
     d = sx["ledger"].state.trade_date
-    released = sx["ledger"].advance_session(d + 2, sx["clock"].wall + 86400,
-                                            {"A": 10_000, "B": 10_000, "C": 10_000})
-    assert released == 100_000
+    released = sx["ledger"].advance_session(
+        d + 2, sx["clock"].wall + 86400,
+        {"A": 10_000, "B": 10_000, "C": 10_000})
+    assert released == 10_000
     assert sx["ledger"].state.trade_date == d + 2
-    assert sx["ledger"].state.cash_settled == 100_000
+    assert sx["ledger"].state.cash_settled == 10_000
 
 
-def test_unk_all_aggregation_binds_issuer_cap(tmp_path):
-    """Two instruments with missing holdings must aggregate into UNK:ALL."""
+def test_unk_all_aggregation_binds_issuer_cap():
+    """Two instruments with missing holdings aggregate into ONE bucket."""
     from quant_m1.core import Instrument
     inst_a = Instrument("X", "PLAIN_ETF", 50_000_000, 10_000, None)
     inst_b = Instrument("Y", "PLAIN_ETF", 50_000_000, 10_000, None)
-    lt_a = inst_a.lookthrough()
-    lt_b = inst_b.lookthrough()
-    assert lt_a == (("UNK:ALL", 10_000),)
-    assert lt_b == (("UNK:ALL", 10_000),)
-    # Both map to same key, so aggregation sums correctly.
+    assert inst_a.lookthrough() == (("UNK:ALL", 10_000),)
+    assert inst_b.lookthrough() == (("UNK:ALL", 10_000),)
     combined = {}
-    for iss, w in lt_a:
+    for iss, w in inst_a.lookthrough():
         combined[iss] = combined.get(iss, 0) + ceil_bps(3_500_000, w)
-    for iss, w in lt_b:
+    for iss, w in inst_b.lookthrough():
         combined[iss] = combined.get(iss, 0) + ceil_bps(3_500_000, w)
     assert combined["UNK:ALL"] == 7_000_000
+    assert combined["UNK:ALL"] > 4_000_000  # breaches a 40% cap on 10M NAV
 
 
-def test_per_constraint_exemption_no_new_breach(sx):
-    """Worsening a pre-existing breach must reject even if another improves."""
-    from quant_m1.risk import evaluate, Usage
-    # This is a structural test: verify the two-pass logic exists.
-    # Full integration requires a carefully constructed breached book.
-    # The unit-level guarantee is tested via the evaluate() code path.
-    pass
+def test_composite_roundtrip_preserves_latch(tmp_path):
+    """Ledger AND divergence latch must survive a composite round-trip."""
+    sx = build(str(tmp_path))
+    tok, intent = _auth(sx, qty=5)
+    sx["gw"].submit(tok, intent)
+    sx["gw"].process(sx["venue"].fill(tok.order_id, 5, price=10_000))
+    sx["gw"].latch_divergence("TEST_LATCH")
+    sx["gw"]._persist()
+
+    sx2 = build(str(tmp_path))
+    assert sx2["gw"]._divergence_latched is True
+    assert sx2["flags"].exec == "DIVERGENT"
+    assert sx2["ledger"].state.positions.get("C") == 5

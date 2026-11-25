@@ -1,28 +1,31 @@
-"""M1.5 authorization kernel and execution gateway.
+"""M1.6 authorization kernel and execution gateway.
 
-Changes over M1.4:
-  - RED-TEAM Q: submit() re-checks NEW_RISK for BUY and re-checks mark
-    staleness at transmission time. A token authorized under permissive flags
-    must not transmit after flags revoke new risk.
-  - RED-TEAM S: restore_flags() restores and verifies the EventLog BEFORE
-    comparing audit heads. A missing or short chain no longer truncates the
-    audit file.
-  - RED-TEAM S: audit-head comparison uses chain membership, not equality.
-    The log may legitimately be AHEAD of the composite (persist-then-append
-    window); only a log that has LOST a recorded event is a divergence.
-  - RED-TEAM S: mismatch paths no longer overwrite the composite. Evidence
-    is preserved for operator inspection.
-  - Composite atomic persistence, stale-o refresh, submit rollback,
-    nonpositive sale proceeds handling retained from M1.4.
+Changes over M1.5:
+  - RED-TEAM B15: the divergence latch is recovered from the audit chain, not
+    from the composite alone. Deleting composite_state.json no longer clears
+    a recorded latch.
+  - RED-TEAM B15: a missing composite alongside a non-empty audit chain is an
+    integrity fault, not a clean first start.
+  - RED-TEAM B15: composite/audit latch disagreement is recorded as a fault.
+    The audit chain is authoritative.
+  - RED-TEAM B15: clear_divergence() requires an authenticated operator
+    command (HMAC over reason+nonce+seq), a current sequence number, and an
+    unused nonce. Replay is rejected against the audit chain.
+
+Retained from M1.5:
+  - Q: submit() re-checks NEW_RISK for BUY and mark staleness at transmission.
+  - S: restore_flags() restores and verifies EventLog BEFORE head comparison;
+    audit-head check uses chain membership; mismatch paths do not overwrite
+    the composite.
 
 PRESERVED VERBATIM: CRASH_A / CRASH_B, RESERVATION_INTENT_MISMATCH,
 _replace_order raising UNKNOWN_ORDER, Kernel.authorize persisting before
-return, LEDGER_ONLY skip, sticky latch, all execution-path methods.
+return, LEDGER_ONLY skip, all execution-path methods.
 
-DEFERRED (requires Token schema change + full test review):
-  - RED-TEAM R: operational-config version is not bound into the token.
-  - RED-TEAM H: ledger control state (nonces, submit_seq, reserved) is not
-    bound into the token digest.
+STILL DEFERRED (require Token schema change or key management):
+  - B1: operational-config version not bound into the token.
+  - B2: ledger control state not bound into the state digest.
+  - B3: persisted ledger is unsigned.
 """
 from __future__ import annotations
 
@@ -45,6 +48,7 @@ KNOWN_KINDS = frozenset({"ACK", "FILL", "CANCEL_ACK", "CANCEL_REJECT", "REJECT",
 
 COMPOSITE_SCHEMA_VERSION = 1
 ZERO_HEAD = "0" * 64
+OPERATOR_CLEAR_ACTION = "CLEAR_DIVERGENCE"
 
 
 class Reject(Exception):
@@ -73,6 +77,12 @@ class Token:
 
 def sign(key: bytes, body: dict) -> str:
     return hmac.new(key, sha(body).encode(), hashlib.sha256).hexdigest()
+
+
+def operator_clear_body(reason: str, nonce: str, seq: int) -> dict:
+    """Canonical body for an operator clear command. Signed by the key holder."""
+    return {"action": OPERATOR_CLEAR_ACTION, "reason": reason,
+            "nonce": nonce, "seq": seq}
 
 
 @dataclass(frozen=True)
@@ -206,6 +216,8 @@ class Gateway:
         self._divergence_latched = False
         self._restore_fault = None
 
+    # ---- durable composite write: ledger + flags + latch + audit head ----
+
     def _persist(self) -> None:
         payload = {
             "schema_version": COMPOSITE_SCHEMA_VERSION,
@@ -227,12 +239,27 @@ class Gateway:
         self.flags.exec = "DIVERGENT"
         self._restore_fault = reason
 
+    def _latch_from_audit(self) -> bool:
+        """Replay the audit chain to determine the authoritative latch state.
+
+        A DIVERGENCE_LATCHED sets it; a DIVERGENCE_CLEARED clears it. The last
+        one wins. This is independent of the composite file, so deleting the
+        composite cannot erase a recorded latch.
+        """
+        latched = False
+        for rec in self.log.chain:
+            kind = rec.get("kind")
+            if kind == "DIVERGENCE_LATCHED":
+                latched = True
+            elif kind == "DIVERGENCE_CLEARED":
+                latched = False
+        return latched
+
     def restore_flags(self) -> bool:
         """Restore composite state, verifying the audit chain FIRST.
 
-        Order matters: comparing a persisted audit head against an unrestored
-        (empty) chain produces a false divergence on every restart, and the
-        subsequent latch append truncates the audit file.
+        The audit chain is authoritative for the divergence latch. The
+        composite is a convenience snapshot and must never override it.
         """
         self._restore_fault = None
 
@@ -243,6 +270,9 @@ class Gateway:
             self._latch_silent("AUDIT_CHAIN_VERIFY_FAILED")
             return True
 
+        audit_latched = self._latch_from_audit()
+        has_history = bool(self.log.chain)
+
         d = self.composite_store.load()
 
         if d is None:
@@ -251,6 +281,11 @@ class Gateway:
             legacy_flags = self.flags_store.load()
 
             if legacy_ledger is None and not legacy_flags:
+                # B15: prior activity with no composite is an integrity fault,
+                # not a clean first start.
+                if has_history:
+                    self._latch_silent("COMPOSITE_MISSING_WITH_AUDIT_HISTORY")
+                    return True
                 return False
 
             if legacy_ledger is not None:
@@ -269,9 +304,15 @@ class Gateway:
                     if k in known:
                         setattr(self.flags, k, v)
                 self._divergence_latched = bool(legacy_flags.get("divergence_latched", False))
-                if (legacy_flags.get("ledger_digest") and
-                        legacy_flags["ledger_digest"] != self.ledger.state.digest()):
-                    self.latch_divergence("FLAGS_LEDGER_DIGEST_MISMATCH")
+
+            # B15: the audit chain overrides any legacy flag value.
+            if audit_latched:
+                self._divergence_latched = True
+                self.flags.exec = "DIVERGENT"
+
+            if has_history:
+                self._latch_silent("COMPOSITE_MISSING_WITH_AUDIT_HISTORY")
+                return True
 
             self._persist()
             return True
@@ -301,8 +342,17 @@ class Gateway:
             if k in known:
                 setattr(self.flags, k, v)
 
-        self._divergence_latched = bool(d.get("divergence_latched", False))
-        if self._divergence_latched:
+        composite_latched = bool(d.get("divergence_latched", False))
+        self._divergence_latched = composite_latched
+
+        # B15: audit chain is authoritative. A composite claiming a clear
+        # latch while the audit records a latch is a tamper/crash signal.
+        if audit_latched:
+            self._divergence_latched = True
+            self.flags.exec = "DIVERGENT"
+            if not composite_latched:
+                self._restore_fault = "COMPOSITE_LATCH_DISAGREES_WITH_AUDIT"
+        elif self._divergence_latched:
             self.flags.exec = "DIVERGENT"
 
         if d.get("ledger_digest") and d["ledger_digest"] != self.ledger.state.digest():
@@ -325,11 +375,48 @@ class Gateway:
         self.flags.exec = "DIVERGENT"
         self.log.append("DIVERGENCE_LATCHED", {"reason": reason}, self.clock.next())
 
-    def clear_divergence(self, operator_reason: str) -> None:
-        self._divergence_latched = False
-        self.flags.exec = "OK"
-        self.log.append("DIVERGENCE_CLEARED", {"reason": operator_reason}, self.clock.next())
-        self._persist()
+    def operator_clear_signature(self, reason: str, nonce: str, seq: int) -> str:
+        """Mint an operator clear signature. Requires possession of the key.
+
+        Provided so an operator console can produce a valid command without
+        reimplementing the canonical body. Holding the Gateway reference alone
+        is NOT sufficient to clear a latch.
+        """
+        return sign(self.key, operator_clear_body(reason, nonce, seq))
+
+    def clear_divergence(self, operator_reason: str, *, nonce: str | None = None,
+                         seq: int | None = None,
+                         operator_sig: str | None = None) -> None:
+        """Clear a latched divergence. Requires an authenticated operator command.
+
+        B15: a free-text reason is not authorization. The caller must present
+        an HMAC over {action, reason, nonce, seq} keyed by the gateway key,
+        at the current sequence number, with a nonce not already used in a
+        prior DIVERGENCE_CLEARED event.
+        """
+        with self.lock:
+            if not operator_reason or not operator_reason.strip():
+                raise Reject("OPERATOR_REASON_REQUIRED")
+            if nonce is None or seq is None or operator_sig is None:
+                raise Reject("OPERATOR_AUTH_REQUIRED")
+            expected = sign(self.key, operator_clear_body(operator_reason, nonce, seq))
+            if not hmac.compare_digest(operator_sig, expected):
+                raise Reject("OPERATOR_BAD_SIGNATURE")
+            if seq != self.clock.seq:
+                raise Reject("OPERATOR_SEQ_STALE")
+            for rec in self.log.chain:
+                if rec.get("kind") != "DIVERGENCE_CLEARED":
+                    continue
+                if rec.get("payload", {}).get("nonce") == nonce:
+                    raise Reject("OPERATOR_NONCE_REPLAY")
+
+            self._divergence_latched = False
+            self.flags.exec = "OK"
+            self._restore_fault = None
+            self.log.append("DIVERGENCE_CLEARED",
+                            {"reason": operator_reason, "nonce": nonce,
+                             "operator_seq": seq}, self.clock.next())
+            self._persist()
 
     def _watchdog(self) -> bool:
         return os.path.exists(self.watchdog_path)
@@ -356,14 +443,14 @@ class Gateway:
             if self._watchdog():
                 raise Reject("WATCHDOG_STOP")
 
-            # RED-TEAM Q: re-check the FULL permission set at transmission.
+            # Q: re-check the FULL permission set at transmission.
             perms = self.flags.permissions()
             if "SUBMIT" not in perms:
                 raise Reject("MODE_BLOCKS_SUBMIT")
             if intent.side == "BUY" and "NEW_RISK" not in perms:
                 raise Reject("MODE_BLOCKS_NEW_RISK")
 
-            # RED-TEAM Q: re-check data freshness at transmission.
+            # Q: re-check data freshness at transmission.
             if (self.clock.wall < self.ledger.state.mark_wall or
                     self.clock.wall - self.ledger.state.mark_wall
                     > self.cfg.mandate.tau_data_secs):

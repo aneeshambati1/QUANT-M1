@@ -1,25 +1,23 @@
 """Marginal after-cost contribution tracking and meta-weighting.
 
-This is the backward path of the bidirectional loop:
+Backward path of the bidirectional loop:
 
     forward:  weights -> allocation -> execution
     backward: realized PnL -> marginal contribution -> EWMA mean/variance
               -> lower confidence bound -> weights
 
-Exponential propagation is explicit and parameterised by half-life, not
-implied by an unspecified non-linearity:
+Exponential propagation is explicit and parameterised by half-life:
 
     lambda = 1 - 2^(-1/h)
     m_t    = (1-lambda) m_{t-1} + lambda c_t
     v_t    = (1-lambda) v_{t-1} + lambda (c_t - m_{t-1})^2
     LCB    = m_t - kappa sqrt(v_t)
 
-Weight is allocated only when LCB > 0 AND the model has cleared probation.
-A model with no demonstrated positive contribution receives zero weight.
-That is the governing law made arithmetic.
+Weight is allocated only when LCB > 0 AND probation is cleared. A model with
+no demonstrated positive contribution receives zero weight.
 
-UNITS: every contribution is a fractional return per observation, net of cost.
-The caller must supply the same horizon for every model in a comparison set.
+UNITS: fractional return per observation, net of cost. The caller must supply
+the same horizon for every model in a comparison set.
 """
 from __future__ import annotations
 
@@ -45,8 +43,8 @@ def marginal_contribution(with_model: float,
     horizon and the SAME universe, differing only by inclusion of the model.
     cost_frac is the incremental round-trip cost attributable to the model.
 
-    This is a paired difference, not a raw return. A model that earns 20bp
-    while the book would have earned 25bp without it has NEGATIVE contribution.
+    Paired difference, not raw return. A model earning 20bp while the book
+    would have earned 25bp without it has NEGATIVE contribution.
     """
     if not all(math.isfinite(x) for x in (with_model, without_model, cost_frac)):
         raise ValueError("contribution inputs must be finite")
@@ -126,19 +124,29 @@ class ContributionTracker:
     def decay_idle(self, steps: int = 1) -> None:
         """No permanent authority: silence decays weight toward zero.
 
-        Applied when a model produces no observation for a cycle. Mean decays
-        geometrically; variance is held, so the confidence penalty increasingly
-        dominates and LCB falls.
+        Mean decays geometrically; variance is held, so the confidence penalty
+        increasingly dominates and LCB falls.
+
+        Grace accounting is INCREMENTAL. Only the portion of this call that
+        crosses beyond idle_grace decays. This makes repeated small calls
+        equivalent to one large call:
+
+            decay_idle(1) x 10  ==  decay_idle(10)
+
+        The earlier version recomputed the full past-grace span on every call,
+        which double-counted and over-decayed under repeated invocation.
         """
         if steps < 0:
             raise ValueError("steps must be >= 0")
         if self._retired or steps == 0:
             return
+        prev_idle = self.idle
         self.idle += steps
         if self.idle <= self.idle_grace:
             return
-        effective = steps if self.idle - steps >= self.idle_grace else \
-            self.idle - self.idle_grace
+        already_past = max(0, prev_idle - self.idle_grace)
+        now_past = self.idle - self.idle_grace
+        effective = now_past - already_past
         if effective > 0:
             self.mean *= math.pow(1.0 - self._lam, effective)
 

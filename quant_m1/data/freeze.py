@@ -1,9 +1,9 @@
-"""Freeze a price panel to disk with a verifiable content hash.
+"""Freeze a price panel with a verifiable, order-invariant content hash.
 
-A live vendor download is not reproducible: yfinance silently revises
-history. Freezing writes the exact close matrix plus a manifest carrying its
-SHA-256, then RELOADS and verifies bit-exactness before returning. A third
-party can then reproduce the experiment from the frozen artifact alone.
+Writes the canonical close matrix plus a manifest carrying the aggregate hash
+and per-symbol hashes, then RELOADS and verifies bit-exactness before
+returning. Per-symbol hashes let a later revision be attributed to specific
+symbols instead of only flagged in aggregate.
 """
 from __future__ import annotations
 
@@ -14,7 +14,8 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
-from .loader import PricePanel, panel_from_frame, content_hash, DataError
+from .loader import (PricePanel, panel_from_frame, content_hash,
+                     column_hashes, DataError)
 
 
 def freeze_panel(panel: PricePanel, out_dir: str, name: str) -> dict:
@@ -27,19 +28,21 @@ def freeze_panel(panel: PricePanel, out_dir: str, name: str) -> dict:
     manifest = {
         "name": name,
         "content_hash": panel.content_hash or content_hash(panel.close),
+        "column_hashes": column_hashes(panel.close),
+        "column_order": [str(c) for c in panel.close.columns],
         "source": panel.source, "vintage": panel.vintage,
         "pit": panel.pit, "label": panel.label,
         "n_rows": int(panel.close.shape[0]),
         "n_symbols": int(panel.close.shape[1]),
-        "symbols": [str(c) for c in panel.close.columns],
+        "symbols": sorted(str(c) for c in panel.close.columns),
         "start": str(panel.close.index[0]), "end": str(panel.close.index[-1]),
         "frozen_at": datetime.now(timezone.utc).isoformat(),
         "versions": {"numpy": np.__version__, "pandas": pd.__version__},
         "csv_float_format": "%.17g",
+        "hash_scheme": "sha256(index_iso + sorted_cols + float64_le); columns sorted",
     }
     man_path.write_text(json.dumps(manifest, indent=2, sort_keys=True))
 
-    # Self-check: the artifact must reload to the identical hash.
     back = load_frozen(out_dir, name)
     if back.content_hash != manifest["content_hash"]:
         raise DataError("freeze round-trip changed content hash")

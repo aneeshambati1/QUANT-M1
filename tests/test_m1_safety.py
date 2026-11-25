@@ -2,7 +2,7 @@
 
 Updated for M1.5 core/risk/authority:
   - Stale-cum asserts SNAPSHOT_RECONCILED and restores from composite.
-  - Settlement fixture sized so the post-trade book is issuer-compliant.
+  - Settlement fixture uses cash=0 so ledger and venue start consistent.
   - G0 detection tests for session authority and UNK:ALL aggregation.
 """
 from __future__ import annotations
@@ -27,7 +27,7 @@ def _auth(sx, symbol="C", side="BUY", qty=10, price=10_000, cost=10):
 
 
 def _restore_ledger(sx):
-    """Restore ledger from the composite state file written by Gateway._persist."""
+    """Restore ledger from the composite state written by Gateway._persist."""
     d = sx["gw"].composite_store.load()
     assert d is not None, "composite_state.json must exist after _persist"
     return Ledger.from_dict(d["ledger"], sx["ledger"].store)
@@ -61,17 +61,21 @@ def test_sell_proceeds_cannot_fund_same_day_buy(tmp_path):
 
 
 def test_settlement_next_session_enables_buy(tmp_path):
-    """T+1 gate: sell proceeds unusable same day, usable next session.
+    """T+1 gate: proceeds unusable same day, usable next session.
 
-    Fixture sized so the traded notional stays inside the issuer cap:
-    NAV = 100_000, issuer cap = 40_000, trade notional = 10_000.
+    cash=0 keeps ledger and venue consistent from construction.
+    1 share at 10_000 cents = 10_000 notional, NAV = 10_000.
+    Issuer cap = floor_bps(10_000, 4_000) = 4_000.
+    Post-buy UNK:ALL = 10_000 would breach, so we buy symbol A instead,
+    whose ISS1/ISS2 split keeps each bucket at 6_000/4_000... still over.
+
+    Correct approach: size NAV large enough that the traded notional fits
+    inside the issuer cap, while keeping settled cash at zero pre-settlement.
+    Use cash=0, positions A=10 (NAV=100_000, cap=40_000), sell 1 (10_000),
+    then buy 1 of A (ISS1 6_000, ISS2 4_000) -> both under 40_000.
     """
-    sx = build(str(tmp_path), cash=90_000, positions={"A": 1},
+    sx = build(str(tmp_path), cash=0, positions={"A": 10},
                marks={"A": 10_000, "B": 10_000, "C": 10_000})
-    # Drain settled cash so only the receivable can fund the buy.
-    sx["ledger"].state.cash_settled = 0
-    sx["ledger"].persist()
-
     tok, intent = _auth(sx, symbol="A", side="SELL", qty=1, price=10_000, cost=0)
     sx["gw"].submit(tok, intent)
     sx["gw"].process(sx["venue"].fill(tok.order_id, 1, price=10_000))
@@ -83,7 +87,8 @@ def test_settlement_next_session_enables_buy(tmp_path):
     assert sx["ledger"].settle(d + 1) == 10_000
     sx["ledger"].state.trade_date = d + 1
     sx["ledger"].persist()
-    _auth(sx, symbol="C", side="BUY", qty=1, price=10_000, cost=0)
+    # Buy A, not C: A has known holdings, so no UNK:ALL concentration.
+    _auth(sx, symbol="A", side="BUY", qty=1, price=10_000, cost=0)
 
 
 # ---- unsubmitted reservations ----
@@ -106,6 +111,7 @@ def test_recovery_ignores_unsubmitted_reservation(sx):
 
 
 def test_second_authorize_invalidates_first_token(sx):
+    """Fail-closed: state digest binding means an old token cannot be reused."""
     t1, i1 = _auth(sx, qty=5)
     _auth(sx, qty=5)
     with pytest.raises(Reject) as e:
@@ -233,10 +239,8 @@ def test_session_regression_rejected(tmp_path):
 
 
 def test_advance_session_matures_receivable(tmp_path):
-    sx = build(str(tmp_path), cash=90_000, positions={"A": 1},
+    sx = build(str(tmp_path), cash=0, positions={"A": 10},
                marks={"A": 10_000, "B": 10_000, "C": 10_000})
-    sx["ledger"].state.cash_settled = 0
-    sx["ledger"].persist()
     tok, intent = _auth(sx, symbol="A", side="SELL", qty=1, price=10_000, cost=0)
     sx["gw"].submit(tok, intent)
     sx["gw"].process(sx["venue"].fill(tok.order_id, 1, price=10_000))
@@ -262,7 +266,7 @@ def test_unk_all_aggregation_binds_issuer_cap():
     for iss, w in inst_b.lookthrough():
         combined[iss] = combined.get(iss, 0) + ceil_bps(3_500_000, w)
     assert combined["UNK:ALL"] == 7_000_000
-    assert combined["UNK:ALL"] > 4_000_000  # breaches a 40% cap on 10M NAV
+    assert combined["UNK:ALL"] > 4_000_000
 
 
 def test_composite_roundtrip_preserves_latch(tmp_path):

@@ -48,7 +48,6 @@ def test_regime_boundaries(corr, expected):
 
 
 def test_breadth_matches_adopted_conservative_measure():
-    # Dossier: effective_breadth(46, 0.436) = 2.2308 (variance-based).
     assert effective_breadth_var(46, 0.436) == pytest.approx(2.2308, abs=1e-3)
 
 
@@ -67,7 +66,7 @@ def test_breadth_invalid_returns_zero_not_guess():
 def test_unknown_is_not_calm():
     s = _state(avg_corr=None)
     assert s.regime is Regime.UNKNOWN
-    assert s.data_unknown is False  # corr alone missing is not data_unknown
+    assert s.data_unknown is False
 
 
 def test_data_unknown_requires_vol_or_liquidity_missing():
@@ -81,12 +80,15 @@ def test_data_unknown_requires_vol_or_liquidity_missing():
 def test_policy_is_total_over_state_grid():
     """Every reachable state combination yields exactly one action.
 
-    liq excludes None because liq=None triggers R2_DATA_UNKNOWN before any
-    regime-dependent rule. Separate tests cover the liq=None path.
+    vol_ann includes None so R2_DATA_UNKNOWN fires.
+    liquidity_score excludes None so R9_REGIME_UNKNOWN can fire when corr=None
+    without being shadowed by R2.
+    Separate explicit tests cover liq=None and the R9 reachability case.
     """
     seen = set()
-    for corr, liq, age, dis, div, dd, cost in itertools.product(
+    for corr, vol, liq, age, dis, div, dd, cost in itertools.product(
         [None, 0.436, 0.65, 0.80, 0.90],
+        [None, 0.155],
         [0.1, 1.0],
         [None, 10, 500],
         [None, 0.1, 0.9],
@@ -94,9 +96,10 @@ def test_policy_is_total_over_state_grid():
         [0, 2000],
         [False, True],
     ):
-        s = _state(avg_corr=corr, liquidity_score=liq, data_age_secs=age,
-                   model_disagreement=dis, execution_divergent=div,
-                   drawdown_bps=dd, cost_exceeds_edge=cost)
+        s = _state(avg_corr=corr, vol_ann=vol, liquidity_score=liq,
+                   data_age_secs=age, model_disagreement=dis,
+                   execution_divergent=div, drawdown_bps=dd,
+                   cost_exceeds_edge=cost)
         d = decide(s)
         assert isinstance(d.action, Action)
         assert d.rule_id in RULE_ORDER
@@ -237,7 +240,7 @@ def test_sustained_negative_retires_permanently():
         t.update(-0.01)
     assert t.status is ModelStatus.RETIRED
     before = t.mean
-    t.update(0.05)  # retirement is absorbing
+    t.update(0.05)
     assert t.mean == before
     assert t.raw_weight() == 0.0
 
@@ -285,25 +288,17 @@ def _trained(**kw):
 
 @pytest.mark.parametrize("grace", [0, 3, 5, 12])
 def test_idle_decay_is_additive_across_call_splitting(grace):
-    """decay_idle(1) x N must equal decay_idle(N).
-
-    The pre-fix version recomputed the whole past-grace span each call, so
-    repeated small calls over-decayed. This test fails on that version.
-    """
     one_shot = _trained(idle_grace=grace)
     many_calls = _trained(idle_grace=grace)
     assert one_shot.mean == pytest.approx(many_calls.mean)
-
     one_shot.decay_idle(20)
     for _ in range(20):
         many_calls.decay_idle(1)
-
     assert many_calls.idle == one_shot.idle == 20
     assert many_calls.mean == pytest.approx(one_shot.mean, rel=1e-12)
 
 
 def test_idle_decay_crossing_grace_decays_only_the_excess():
-    """With grace=5, decay_idle(8) must decay exactly 3 steps, not 8."""
     t = _trained(idle_grace=5)
     peak = t.mean
     lam = _ewma_lambda(t.half_life_obs)
@@ -313,12 +308,11 @@ def test_idle_decay_crossing_grace_decays_only_the_excess():
 
 
 def test_idle_decay_two_stage_crossing_matches_single_call():
-    """4 then 4 with grace=5 must equal 8 in one call (3 effective steps)."""
     single = _trained(idle_grace=5)
     staged = _trained(idle_grace=5)
     single.decay_idle(8)
-    staged.decay_idle(4)   # entirely within grace, no decay
-    staged.decay_idle(4)   # crosses grace, 3 effective steps
+    staged.decay_idle(4)
+    staged.decay_idle(4)
     assert staged.mean == pytest.approx(single.mean, rel=1e-12)
 
 

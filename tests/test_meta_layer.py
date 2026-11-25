@@ -1,7 +1,7 @@
 """Meta-layer acceptance tests.
 
 Covers: regime boundaries, policy totality and priority, EWMA half-life,
-LCB gating, probation, retirement, idle decay, and the all-zero weight case.
+LCB gating, probation, retirement, idle decay additivity, all-zero weights.
 """
 from __future__ import annotations
 
@@ -91,7 +91,6 @@ def test_policy_is_total_over_state_grid():
         assert isinstance(d.action, Action)
         assert d.rule_id in RULE_ORDER
         seen.add(d.rule_id)
-    # Every rule must be reachable, otherwise it is dead policy.
     assert seen == set(RULE_ORDER), f"unreachable rules: {set(RULE_ORDER) - seen}"
 
 
@@ -147,7 +146,6 @@ def test_high_disagreement_reduces_alpha():
 # ---- marginal contribution ----
 
 def test_marginal_is_paired_difference_not_raw_return():
-    # Model earns 20bp, book would have earned 25bp without it, cost 3bp.
     c = marginal_contribution(0.0020, 0.0025, 0.0003)
     assert c == pytest.approx(-0.0008)
     assert c < 0
@@ -168,7 +166,6 @@ def test_marginal_rejects_non_finite():
 def test_lambda_matches_half_life_definition():
     h = 60.0
     lam = _ewma_lambda(h)
-    # After h steps of pure decay, retained fraction must be 1/2.
     assert math.pow(1.0 - lam, h) == pytest.approx(0.5, abs=1e-12)
 
 
@@ -256,6 +253,56 @@ def test_update_resets_idle():
     assert t.idle == 10
     t.update(0.001)
     assert t.idle == 0
+
+
+# ---- idle decay additivity (locks the grace-accounting fix) ----
+
+def _trained(**kw):
+    params = dict(half_life_obs=5.0, probation_obs=10, prior_std=0.001)
+    params.update(kw)
+    t = ContributionTracker(**params)
+    for _ in range(100):
+        t.update(0.01)
+    return t
+
+
+@pytest.mark.parametrize("grace", [0, 3, 5, 12])
+def test_idle_decay_is_additive_across_call_splitting(grace):
+    """decay_idle(1) x N must equal decay_idle(N).
+
+    The pre-fix version recomputed the whole past-grace span each call, so
+    repeated small calls over-decayed. This test fails on that version.
+    """
+    one_shot = _trained(idle_grace=grace)
+    many_calls = _trained(idle_grace=grace)
+    assert one_shot.mean == pytest.approx(many_calls.mean)
+
+    one_shot.decay_idle(20)
+    for _ in range(20):
+        many_calls.decay_idle(1)
+
+    assert many_calls.idle == one_shot.idle == 20
+    assert many_calls.mean == pytest.approx(one_shot.mean, rel=1e-12)
+
+
+def test_idle_decay_crossing_grace_decays_only_the_excess():
+    """With grace=5, decay_idle(8) must decay exactly 3 steps, not 8."""
+    t = _trained(idle_grace=5)
+    peak = t.mean
+    lam = _ewma_lambda(t.half_life_obs)
+    t.decay_idle(8)
+    expected = peak * math.pow(1.0 - lam, 3)
+    assert t.mean == pytest.approx(expected, rel=1e-12)
+
+
+def test_idle_decay_two_stage_crossing_matches_single_call():
+    """4 then 4 with grace=5 must equal 8 in one call (3 effective steps)."""
+    single = _trained(idle_grace=5)
+    staged = _trained(idle_grace=5)
+    single.decay_idle(8)
+    staged.decay_idle(4)   # entirely within grace, no decay
+    staged.decay_idle(4)   # crosses grace, 3 effective steps
+    assert staged.mean == pytest.approx(single.mean, rel=1e-12)
 
 
 # ---- weight aggregation ----

@@ -1,0 +1,27 @@
+{
+  "panel": {
+    "end": "2024-12-31 00:00:00+00:00",
+    "label": "PROVISIONAL - yfinance back-adjusted, NON-PIT, gross of cost",
+    "n_rows": 2516,
+    "n_symbols": 10,
+    "pit": false,
+    "source": "yfinance",
+    "start": "2015-01-02 00:00:00+00:00",
+    "vintage": "downloaded:2026-11-25T12:25:13.509683+00:00"
+  },
+  "report": {
+    "eff_n": 618.4121467257545,
+    "evidence_label": "PROVISIONAL - yfinance back-adjusted, NON-PIT, gross of cost",
+    "hac_se": 0.015476707530185516,
+    "horizon": "10d",
+    "lags": 8,
+    "mean_ic": 0.0005716010771542012,
+    "n_assets": 10,
+    "n_dropped": 0,
+    "n_obs": 2501,
+    "naive_se": 0.009176335514409389,
+    "rho1": 0.6035072522399056,
+    "t_hac": 0.03693298952890076,
+    "t_naive": 0.06229077786624401
+  }
+}

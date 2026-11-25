@@ -20,28 +20,23 @@ class ResidualReport:
     n_factors: int
     n_obs: int
 
-    # Raw spectrum
     raw_eigenvalues: np.ndarray
     raw_participation_ratio: float
     raw_var_based_neff: float
 
-    # Residual spectrum (un-normalized)
     residual_eigenvalues: np.ndarray
     residual_trace: float
     residual_participation_ratio: float
     residual_var_based_neff: float
 
-    # Residual spectrum (renormalized to unit diagonal)
     renorm_residual_eigenvalues: np.ndarray
     renorm_participation_ratio: float
     renorm_var_based_neff: float
 
-    # Leverage-constrained breadth
     avg_residual_variance_frac: float
     min_leverage_for_unit_risk: float
     leverage_constrained_neff: float
 
-    # Shrinkage
     lw_shrinkage_intensity: float
     residual_condition_number: float
 
@@ -82,7 +77,6 @@ def _var_based_neff(eigenvalues: np.ndarray) -> float:
     ss = np.sum(eigenvalues ** 2)
     if s == 0:
         return float(n)
-    # Implied equicorrelation from spectrum
     rho = (ss / (s * s / n) - 1.0) / max(n - 1, 1)
     rho = max(rho, -1.0 / max(n - 1, 1))
     rho = min(rho, 1.0)
@@ -100,11 +94,7 @@ def _ledoit_wolf_identity(X: np.ndarray) -> Tuple[np.ndarray, float]:
     sample = np.cov(X, rowvar=False, bias=True)
     mu = np.trace(sample) / p
     delta = sample - mu * np.eye(p)
-    # Sum of squared off-diagonal + squared diagonal deviations
     sum_sq = np.sum(delta ** 2)
-    # Estimate optimal shrinkage intensity (simplified LW formula)
-    # For identity target: kappa = sum Var(x_ij^2) / sum (s_ij - mu*delta_ij)^2
-    # Use the oracle-approximating formula from LW 2004
     Xc = X - X.mean(axis=0)
     phi_mat = (Xc ** 2).T @ (Xc ** 2) / n - sample ** 2
     phi = np.sum(phi_mat)
@@ -148,6 +138,10 @@ class FactorModel:
             raise ValueError("returns must be 2D (n_obs, n_assets)")
         if factor_returns.ndim != 2:
             raise ValueError("factor_returns must be 2D (n_obs, n_factors)")
+        if returns.shape[1] < 1:
+            raise ValueError("returns must have at least one asset")
+        if factor_returns.shape[1] < 1:
+            raise ValueError("factor_returns must have at least one factor")
         if returns.shape[0] != factor_returns.shape[0]:
             raise ValueError("returns and factor_returns must have same n_obs")
         if returns.shape[0] < returns.shape[1] + factor_returns.shape[1] + 1:
@@ -156,34 +150,27 @@ class FactorModel:
         n_obs, n_assets = returns.shape
         n_factors = factor_returns.shape[1]
 
-        # OLS factor loadings: R_asset = B @ R_factor + epsilon
-        # B = (F'F)^{-1} F' R
         FtF = factor_returns.T @ factor_returns
         FtR = factor_returns.T @ returns
         try:
-            B = np.linalg.solve(FtF, FtR)  # (n_factors, n_assets)
+            B = np.linalg.solve(FtF, FtR)
         except np.linalg.LinAlgError:
             B = np.linalg.lstsq(factor_returns, returns, rcond=None)[0].T
 
-        residuals = returns - factor_returns @ B  # (n_obs, n_assets)
+        residuals = returns - factor_returns @ B
 
-        # Raw covariance spectrum
         raw_cov = np.cov(returns, rowvar=False, bias=True)
         raw_eigs = np.sort(np.linalg.eigvalsh(raw_cov))[::-1]
         raw_eigs = np.maximum(raw_eigs, 0.0)
 
-        # Residual covariance with LW shrinkage
-        resid_sample = np.cov(residuals, rowvar=False, bias=True)
         resid_shrunk, lw_intensity = _ledoit_wolf_identity(residuals)
         resid_eigs = np.sort(np.linalg.eigvalsh(resid_shrunk))[::-1]
         resid_eigs = np.maximum(resid_eigs, 0.0)
         resid_trace = float(np.sum(resid_eigs))
 
-        # Condition number
         pos_eigs = resid_eigs[resid_eigs > 0]
         cond = float(pos_eigs[0] / pos_eigs[-1]) if len(pos_eigs) > 1 else 1.0
 
-        # Renormalized residual correlation matrix
         diag = np.diag(resid_shrunk)
         diag_safe = np.where(diag > 0, diag, 1.0)
         D_inv_sqrt = np.diag(1.0 / np.sqrt(diag_safe))
@@ -191,26 +178,17 @@ class FactorModel:
         renorm_eigs = np.sort(np.linalg.eigvalsh(resid_corr))[::-1]
         renorm_eigs = np.maximum(renorm_eigs, 0.0)
 
-        # Average residual variance as fraction of raw
         raw_trace = float(np.sum(raw_eigs))
         avg_resid_frac = resid_trace / raw_trace if raw_trace > 0 else 1.0
 
-        # Minimum leverage for unit risk equalization (Jensen bound)
-        # E[r_ii^{-1/2}] >= (E[r_ii])^{-1/2}
         mean_resid_var = resid_trace / n_assets if n_assets > 0 else 1.0
         if mean_resid_var > 0 and raw_trace > 0:
             min_lev = float(np.sqrt(raw_trace / resid_trace))
         else:
             min_lev = 1.0
 
-        # Leverage-constrained N_eff
-        # Under gross leverage <= 1, the portfolio cannot equalize risk
-        # across low-variance residual factors. Approximate by scaling
-        # the renormalized N_eff by the fraction of variance accessible
-        # at unit leverage. This is a LOWER BOUND.
         lev_constrained_neff = _var_based_neff(resid_eigs)
 
-        # Annualize if requested
         scale = periods_per_year if annualize else 1.0
 
         return ResidualReport(

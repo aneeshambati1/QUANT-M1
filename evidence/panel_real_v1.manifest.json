@@ -1,0 +1,55 @@
+{
+  "column_hashes": {
+    "EEM": "3e1ae9e528e4f122c97bf8887180cf92e4d649fe8a7f59c3eefd78ffb1988f82",
+    "EFA": "9ef38b05c0ec18567c9061c9adb77f4a9b957e825676752d57f2e2dc1b095917",
+    "GLD": "23e7c3f4dbe056fd848d707d50c92ab5e46bc5c8e549af9c13dd28d7017efc91",
+    "IEF": "02ae7185cf44adb35e487b7e26306bef643cbac5d341530dbf6fd9e5143f0079",
+    "IWM": "c06c96823b21a650b6917a276bbef7c72930817b3a7b625f4d4f0a2e08efe4f5",
+    "QQQ": "999cbe7f6bda4b2229ff8ef79aad5ad9e082f2736844033e5296d96959180ab2",
+    "SPY": "67565af37d4c0f089b845e9243471b775de07a2f7e47e3eed9993b477ed356e7",
+    "TLT": "96b63bbde4b1e12d406c4f376f999ad967f2b4391443b18c745d3f3ceb6caa3b",
+    "USO": "98e0b026bb89591b16697c6a0f032b214d4f8220f9c1817e3141f9ac5cfb1649",
+    "UUP": "8b3b4fa8d6b273f7321e60258c0c1bffdd64ccab3a5c9ef8204efd7f4cecea3c"
+  },
+  "column_order": [
+    "EEM",
+    "EFA",
+    "GLD",
+    "IEF",
+    "IWM",
+    "QQQ",
+    "SPY",
+    "TLT",
+    "USO",
+    "UUP"
+  ],
+  "content_hash": "836b76ddb46d8752525f44c00cc686f3859f6303b8bca864439568a7face0988",
+  "csv_float_format": "%.17g",
+  "end": "2024-12-31 00:00:00+00:00",
+  "frozen_at": "2026-11-25T16:59:52.744156+00:00",
+  "hash_scheme": "sha256(index_iso + sorted_cols + float64_le); columns sorted",
+  "label": "PROVISIONAL - yfinance back-adjusted, NON-PIT, gross of cost",
+  "n_rows": 2516,
+  "n_symbols": 10,
+  "name": "panel_real_v1",
+  "pit": false,
+  "source": "yfinance",
+  "start": "2015-01-02 00:00:00+00:00",
+  "symbols": [
+    "EEM",
+    "EFA",
+    "GLD",
+    "IEF",
+    "IWM",
+    "QQQ",
+    "SPY",
+    "TLT",
+    "USO",
+    "UUP"
+  ],
+  "versions": {
+    "numpy": "2.4.6",
+    "pandas": "2.2.3"
+  },
+  "vintage": "downloaded:2026-11-25T16:59:52.053704+00:00"
+}

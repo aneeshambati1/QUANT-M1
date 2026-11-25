@@ -1,16 +1,12 @@
 """Governed measurement protocol. Registration BEFORE execution.
 
-Two entry points:
-
   run_governed  - one hypothesis, registered then measured then gated.
   run_grid      - a FULL search grid registered up front, then measured.
-                  Declaring the grid before seeing results is what makes
-                  the multiple-testing correction honest. Sequential
-                  "try, look, try again" search is not supported here.
 
-Duplicate control: a hypothesis fingerprint is derived from family, config,
-and panel IDENTITY (source, date range, symbols) - not from the download
-timestamp. Re-downloading the same range does not create a new trial.
+Dedup identity is unchanged (family, config, panel identity) so historical
+ledger entries remain comparable. CONTENT DRIFT is a separate check: if a
+prior trial recorded the same panel_key but a different content_hash, the
+vendor silently revised the data and the run is refused.
 """
 from __future__ import annotations
 
@@ -32,12 +28,16 @@ def _canon(obj) -> str:
 
 
 def panel_identity(panel: PricePanel) -> dict:
-    """Content identity, deliberately excluding the download timestamp."""
+    """Content identity EXCLUDING the download timestamp and the prices."""
     return {"source": panel.source,
             "start": str(panel.close.index[0]),
             "end": str(panel.close.index[-1]),
-            "symbols": sorted(panel.close.columns.tolist()),
+            "symbols": sorted(str(c) for c in panel.close.columns),
             "n_rows": int(panel.close.shape[0])}
+
+
+def panel_key(panel: PricePanel) -> str:
+    return hashlib.sha256(_canon(panel_identity(panel)).encode()).hexdigest()
 
 
 def fingerprint(family: str, config: dict, panel: PricePanel) -> str:
@@ -51,6 +51,19 @@ def _check_duplicate(led: TrialLedger, fp: str) -> None:
             raise ProtocolError(
                 f"hypothesis already registered as {t['trial_id']}; "
                 "re-running it does not create a new trial")
+
+
+def _check_content_drift(led: TrialLedger, panel: PricePanel) -> None:
+    if not panel.content_hash:
+        return
+    pk = panel_key(panel)
+    for t in led.trials():
+        if t.get("panel_key") == pk and t.get("content_hash") \
+                and t["content_hash"] != panel.content_hash:
+            raise ProtocolError(
+                f"panel content changed under identical identity "
+                f"(prior trial {t['trial_id']}). Freeze the panel and "
+                f"register the new content as a distinct dataset.")
 
 
 def _write_raw(out_dir: Path, trial_id: str, payload: dict) -> str:
@@ -67,15 +80,17 @@ def run_governed(ledger_path: str, panel: PricePanel, *, trial_id: str,
     if not commit or not commit.strip():
         raise ProtocolError("commit SHA required")
     led = TrialLedger(ledger_path)
+    _check_content_drift(led, panel)
     cfg = {"lookback": int(lookback), "horizon": int(horizon)}
     fp = fingerprint(family, cfg, panel)
     _check_duplicate(led, fp)
     cfg["fingerprint"] = fp
 
-    # REGISTER BEFORE MEASURING. If measurement raises, the trial still counts.
     led.register_trial(trial_id=trial_id, commit=commit, family=family,
                        hypothesis=hypothesis, config=cfg, seed=int(seed),
-                       data_vintage=panel.vintage)
+                       data_vintage=panel.vintage,
+                       panel_key=panel_key(panel),
+                       content_hash=panel.content_hash)
 
     rep = run_baseline(panel, lookback=lookback, horizon=horizon)
     raw = _write_raw(Path(out_dir), trial_id,
@@ -91,11 +106,6 @@ def run_grid(ledger_path: str, panel: PricePanel, *, family: str,
              hypothesis: str, lookbacks, horizons, commit: str, seed: int,
              out_dir: str, alpha: float = 0.05,
              id_prefix: str = "grid") -> dict:
-    """Pre-register the FULL grid, then measure every cell, then gate at N.
-
-    No result is inspected until every cell is registered. The gate uses the
-    final trial count, so adding cells later cannot retroactively loosen it.
-    """
     if not commit or not commit.strip():
         raise ProtocolError("commit SHA required")
     lbs = [int(x) for x in lookbacks]
@@ -106,6 +116,7 @@ def run_grid(ledger_path: str, panel: PricePanel, *, family: str,
         raise ProtocolError("grid axes must not contain duplicates")
 
     led = TrialLedger(ledger_path)
+    _check_content_drift(led, panel)
     cells = []
     for lb in lbs:
         for hz in hzs:
@@ -114,7 +125,6 @@ def run_grid(ledger_path: str, panel: PricePanel, *, family: str,
             _check_duplicate(led, fp)
             cells.append((lb, hz, fp))
 
-    # Phase 1: register everything before any measurement.
     ids = []
     for lb, hz, fp in cells:
         tid = f"{id_prefix}_lb{lb}_hz{hz}"
@@ -122,12 +132,13 @@ def run_grid(ledger_path: str, panel: PricePanel, *, family: str,
         led.register_trial(trial_id=tid, commit=commit, family=family,
                            hypothesis=hypothesis, config=cfg, seed=int(seed),
                            data_vintage=panel.vintage,
-                           note="pre-registered grid cell")
+                           note="pre-registered grid cell",
+                           panel_key=panel_key(panel),
+                           content_hash=panel.content_hash)
         ids.append(tid)
 
     n_after_register = led.n_trials()
 
-    # Phase 2: measure and record.
     rows = []
     for (lb, hz, fp), tid in zip(cells, ids):
         rep = run_baseline(panel, lookback=lb, horizon=hz)
@@ -140,7 +151,6 @@ def run_grid(ledger_path: str, panel: PricePanel, *, family: str,
                      "mean_ic": rep.mean_ic, "t_hac": rep.t_hac,
                      "report": rep, "raw_output": raw})
 
-    # Phase 3: gate every cell at the full trial count.
     for r in rows:
         r["gate"] = ic_gate(r["t_hac"], n_after_register, alpha)
     rows.sort(key=lambda r: abs(r["t_hac"]), reverse=True)

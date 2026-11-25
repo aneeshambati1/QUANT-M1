@@ -1,13 +1,18 @@
-"""Price panel loading with explicit bar semantics and content identity.
+"""Price panel loading: bar semantics, canonical order, content identity.
 
-BAR SEMANTICS: every index timestamp is the SESSION CLOSE. The close value
-is knowable only at or after that timestamp. A signal from row t uses
-information available at t's close; a forward return spans t to t+h closes.
+BAR SEMANTICS: every index timestamp is the SESSION CLOSE. A signal from row t
+uses information available at t's close; a forward return spans t to t+h closes.
 
-CONTENT IDENTITY: content_hash is SHA-256 over the canonical index, columns,
-and the raw little-endian float64 values. It changes when prices change even
-if source, dates, symbols and row count are identical. This is what makes a
-silent vendor revision detectable.
+CANONICAL ORDER: columns are sorted by name at construction. Column order is
+not data, and an unstable vendor column order must never look like a price
+revision. content_hash is therefore order-invariant by construction.
+
+CONTENT IDENTITY: SHA-256 over the canonical index, sorted column names, and
+the raw little-endian float64 values in that order. It changes if and only if
+dates, symbols, or prices change.
+
+column_hashes() gives per-symbol hashes so a genuine vendor revision can be
+attributed to specific symbols rather than detected only in aggregate.
 """
 from __future__ import annotations
 
@@ -23,15 +28,36 @@ class DataError(Exception):
     pass
 
 
-def content_hash(df: pd.DataFrame) -> str:
-    idx = [t.isoformat() for t in pd.DatetimeIndex(df.index)]
+def _canonical(df: pd.DataFrame) -> pd.DataFrame:
     cols = [str(c) for c in df.columns]
-    vals = np.ascontiguousarray(df.to_numpy(dtype="<f8"))
+    if len(set(cols)) != len(cols):
+        raise DataError("duplicate column names")
+    out = df.copy()
+    out.columns = cols
+    return out.loc[:, sorted(cols)]
+
+
+def _hash_parts(index, names: list[str], values: np.ndarray) -> str:
     h = hashlib.sha256()
-    h.update(json.dumps({"index": idx, "columns": cols},
+    h.update(json.dumps({"index": list(index), "columns": names},
                         sort_keys=True, separators=(",", ":")).encode())
-    h.update(vals.tobytes())
+    h.update(np.ascontiguousarray(values, dtype="<f8").tobytes())
     return h.hexdigest()
+
+
+def content_hash(df: pd.DataFrame) -> str:
+    c = _canonical(df)
+    idx = [t.isoformat() for t in pd.DatetimeIndex(c.index)]
+    return _hash_parts(idx, [str(x) for x in c.columns], c.to_numpy(dtype="<f8"))
+
+
+def column_hashes(df: pd.DataFrame) -> dict:
+    """Per-symbol hash. Use to attribute a revision to specific symbols."""
+    c = _canonical(df)
+    idx = [t.isoformat() for t in pd.DatetimeIndex(c.index)]
+    return {str(col): _hash_parts(idx, [str(col)],
+                                  c[[col]].to_numpy(dtype="<f8"))
+            for col in c.columns}
 
 
 @dataclass(frozen=True)
@@ -67,7 +93,7 @@ def panel_from_frame(df: pd.DataFrame, *, source: str, vintage: str,
     if idx.has_duplicates:
         raise DataError("duplicate session timestamps")
     idx = idx.tz_localize("UTC") if idx.tz is None else idx.tz_convert("UTC")
-    out = df.copy()
+    out = _canonical(df)
     out.index = idx
     v = out.to_numpy(dtype=float)
     finite = v[np.isfinite(v)]

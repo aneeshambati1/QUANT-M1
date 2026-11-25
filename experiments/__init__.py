@@ -1,0 +1,1 @@
+"""Pre-registered experiments. Each module declares its search space at import."""

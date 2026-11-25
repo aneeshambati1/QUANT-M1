@@ -1,26 +1,27 @@
-"""M1.4 authorization kernel and execution gateway.
+"""M1.5 authorization kernel and execution gateway.
 
-Changes over M1.3:
-  - Composite atomic persistence: ledger + flags + latch + audit head in ONE file.
-  - Matching composite restore path reconstructs ledger AND flags together.
-  - Legacy flags.json migration on first restore.
-  - submit() rolls back RAM state if pre-send persistence fails.
-  - process() refreshes local order after applying venue-authoritative fill.
-  - Nonpositive sale proceeds logged or latched instead of vanishing silently.
-  - Obsolete price-based _apply_fill helper removed.
-  - CRASH_A / CRASH_B injection points preserved verbatim.
-  - Reservation-intent binding preserved verbatim.
-  - Sticky divergence latch preserved.
+Changes over M1.4:
+  - RED-TEAM Q: submit() re-checks NEW_RISK for BUY and re-checks mark staleness.
+    A token authorized under permissive flags must not transmit after flags revoke
+    new risk. Flags are not part of VerifiedState.digest(), so the token alone
+    cannot enforce this.
+  - RED-TEAM S: restore_flags() restores and verifies the EventLog BEFORE comparing
+    audit heads. A missing/short chain no longer truncates the audit file.
+  - RED-TEAM S: audit-head comparison uses chain membership, not equality. The log
+    may legitimately be AHEAD of the composite (persist-then-append window); only a
+    log that has LOST a recorded event is a divergence.
+  - RED-TEAM S: mismatch paths no longer overwrite the composite. Evidence is
+    preserved for operator inspection.
+  - Composite atomic persistence, stale-o refresh, submit rollback, nonpositive
+    sale proceeds handling retained from M1.4.
 
-Safety rules:
-- one shared lock serializes authorization, submission, events and recovery;
-- every order is bound to an immutable intent, ledger snapshot AND configuration;
-- nonce is durably consumed before transmission;
-- ambiguous broker state never releases a reservation;
-- fills use venue-authoritative notional, not the order limit price;
-- cancellation/rejection is terminal only after broker snapshot confirmation;
-- reconciliation failure is never reported as APPLIED;
-- a latched divergence is never cleared automatically.
+PRESERVED VERBATIM: CRASH_A / CRASH_B, RESERVATION_INTENT_MISMATCH,
+_replace_order raising UNKNOWN_ORDER, Kernel.authorize persisting before return,
+LEDGER_ONLY skip, sticky latch, all execution-path methods.
+
+DEFERRED (requires Token schema change + full test review):
+  - RED-TEAM R: operational-config version is not bound into the token.
+  - RED-TEAM H: ledger control state (nonces, submit_seq, reserved) is not bound.
 """
 from __future__ import annotations
 
@@ -32,7 +33,7 @@ import uuid
 from dataclasses import asdict, dataclass
 
 from .core import (Money, Shares, Clock, ConfigAuthority, EventLog, Instrument,
-                   Ledger, Store, WorkingOrder, sha)
+                   Ledger, Store, WorkingOrder, ceil_bps, sha)
 from .flags import Flags
 from .risk import evaluate, reservations, CONSTRAINTS
 from .venue import MockVenue, ExecEvent
@@ -42,6 +43,7 @@ TERMINAL_VENUE = frozenset({"CANCELLED", "REJECTED", "FILLED"})
 KNOWN_KINDS = frozenset({"ACK", "FILL", "CANCEL_ACK", "CANCEL_REJECT", "REJECT", "TIMEOUT"})
 
 COMPOSITE_SCHEMA_VERSION = 1
+ZERO_HEAD = "0" * 64
 
 
 class Reject(Exception):
@@ -215,12 +217,33 @@ class Gateway:
         }
         self.composite_store.save(payload)
 
-    def restore_flags(self) -> bool:
-        """Restore composite state if present; otherwise migrate legacy files.
+    def _latch_silent(self, reason: str) -> None:
+        """Latch WITHOUT appending to the audit chain and WITHOUT persisting.
 
-        Returns True if a persisted state was found and restored.
-        On schema mismatch or digest mismatch, latches divergence.
+        Used on restore failures, where appending would overwrite the very
+        evidence that failed verification. The reason is surfaced via flags.exec
+        and must be inspected by an operator against the on-disk artifacts.
         """
+        self._divergence_latched = True
+        self.flags.exec = "DIVERGENT"
+        self._restore_fault = reason
+
+    def restore_flags(self) -> bool:
+        """Restore composite state, verifying the audit chain FIRST.
+
+        Order matters: comparing a persisted audit head against an unrestored
+        (empty) chain produces a false divergence on every restart, and the
+        subsequent latch append truncates the audit file.
+        """
+        self._restore_fault = None
+
+        # 1. Restore and verify the audit chain before any head comparison.
+        try:
+            self.log.restore()
+        except ValueError:
+            self._latch_silent("AUDIT_CHAIN_VERIFY_FAILED")
+            return True
+
         d = self.composite_store.load()
 
         if d is None:
@@ -251,19 +274,17 @@ class Gateway:
                         legacy_flags["ledger_digest"] != self.ledger.state.digest()):
                     self.latch_divergence("FLAGS_LEDGER_DIGEST_MISMATCH")
 
-            # Migrate: write composite so next restore uses the new path.
             self._persist()
             return True
 
+        # 2. Schema mismatch: preserve the artifact, do not overwrite.
         if d.get("schema_version") != COMPOSITE_SCHEMA_VERSION:
-            self.latch_divergence("FLAGS_SCHEMA_UNKNOWN")
-            self._persist()
+            self._latch_silent("FLAGS_SCHEMA_UNKNOWN")
             return True
 
         ledger_data = d.get("ledger")
         if ledger_data is None:
-            self.latch_divergence("COMPOSITE_LEDGER_MISSING")
-            self._persist()
+            self._latch_silent("COMPOSITE_LEDGER_MISSING")
             return True
 
         restored = Ledger.from_dict(ledger_data, self.ledger.store)
@@ -282,12 +303,21 @@ class Gateway:
                 setattr(self.flags, k, v)
 
         self._divergence_latched = bool(d.get("divergence_latched", False))
+        if self._divergence_latched:
+            self.flags.exec = "DIVERGENT"
 
         if d.get("ledger_digest") and d["ledger_digest"] != self.ledger.state.digest():
-            self.latch_divergence("FLAGS_LEDGER_DIGEST_MISMATCH")
+            self._latch_silent("FLAGS_LEDGER_DIGEST_MISMATCH")
+            return True
 
-        if d.get("audit_head") and d["audit_head"] != self.log.head():
-            self.latch_divergence("AUDIT_HEAD_MISMATCH")
+        # 3. Audit head: the log may legitimately be AHEAD of the composite
+        #    (persist-then-append window). Only a LOST event is a divergence.
+        expected = d.get("audit_head")
+        if expected and expected != ZERO_HEAD:
+            chain_hashes = {r.get("hash") for r in self.log.chain}
+            if expected not in chain_hashes:
+                self._latch_silent("AUDIT_HEAD_MISSING_FROM_CHAIN")
+                return True
 
         return True
 
@@ -326,8 +356,22 @@ class Gateway:
             intent.validate()
             if self._watchdog():
                 raise Reject("WATCHDOG_STOP")
-            if "SUBMIT" not in self.flags.permissions():
+
+            # RED-TEAM Q: re-check the FULL permission set at transmission time.
+            # Flags are not bound into VerifiedState.digest(), so a token issued
+            # under permissive flags would otherwise survive a NEW_RISK revoke.
+            perms = self.flags.permissions()
+            if "SUBMIT" not in perms:
                 raise Reject("MODE_BLOCKS_SUBMIT")
+            if intent.side == "BUY" and "NEW_RISK" not in perms:
+                raise Reject("MODE_BLOCKS_NEW_RISK")
+
+            # RED-TEAM Q: re-check data freshness at transmission time.
+            if (self.clock.wall < self.ledger.state.mark_wall or
+                    self.clock.wall - self.ledger.state.mark_wall
+                    > self.cfg.mandate.tau_data_secs):
+                raise Reject("STALE_MARKS")
+
             if not hmac.compare_digest(tok.sig, sign(self.key, tok.body())):
                 raise Reject("BAD_SIGNATURE")
             if tok.intent_hash != intent.hash():
@@ -361,7 +405,6 @@ class Gateway:
             if len(recent) >= self.cfg.mandate.rate_limit:
                 raise Reject("RATE_LIMIT")
 
-            # Rollback on pre-send persistence failure.
             old_nonces = set(self.ledger.spent_nonces)
             old_submit_seq = list(self.ledger.submit_seq)
             old_working = self.ledger.state.working
@@ -460,7 +503,6 @@ class Gateway:
                         self._persist()
                         return "INVALID_FILL_BLOCKED"
                     self._apply_snapshot_fill(ev.order_id, vo["cum_qty"], dn, dc)
-                    # Refresh local order after replacement; stale-o bug fix.
                     o = self._find(ev.order_id)
                 if ev.cum_qty < o.cum_filled:
                     reconciled = self._reconcile_snapshot()

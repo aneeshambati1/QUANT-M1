@@ -16,6 +16,7 @@ def blend_signals(model_weights: Mapping[str, float],
 
     Args:
         model_weights: {model_name: weight}. Models with 0 weight are ignored.
+                       Weights must be finite, real, and non-negative.
         model_signals: {model_name: 1D array of expected returns per asset}.
                        All arrays must share length and asset ordering.
 
@@ -26,11 +27,21 @@ def blend_signals(model_weights: Mapping[str, float],
     if not model_weights or not model_signals:
         raise ValueError("model_weights and model_signals must not be empty")
 
+    for m, w in model_weights.items():
+        if isinstance(w, bool) or not isinstance(w, (int, float)):
+            raise ValueError(f"weight for model {m} must be a real number")
+        if not np.isfinite(w):
+            raise ValueError(f"weight for model {m} must be finite")
+        if w < 0.0:
+            raise ValueError(f"weight for model {m} must be >= 0")
+
     active_models = [m for m, w in model_weights.items() if w > 0.0]
     if not active_models:
         raise ValueError("at least one model must have weight > 0")
 
     n_assets = len(model_signals[active_models[0]])
+    if n_assets < 1:
+        raise ValueError("signal vectors must be non-empty")
     blended = np.zeros(n_assets, dtype=float)
     total_weight = 0.0
 

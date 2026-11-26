@@ -1,0 +1,23 @@
+# HYP-014: Adaptive Holding Period (momentum-conditional extension)
+
+Status: PARKED — NEVER EVALUATED ON ANY DATA
+Registered: 2026-11-27
+Multiplicity cost to date: 0 (untested; rules locked ex-ante)
+
+## Rules (frozen as written, no post-hoc edits permitted)
+
+- Signal: 21-day total-return cross-sectional rank
+- Base hold: 5 trading days
+- Extension: rank in top 20% at day-4 check → extend to 21 days
+- Early exit: rank falls below top 40% at any daily check → exit
+- Hard cap: 21 trading days
+
+## Promotion conditions (ALL required)
+
+1. Panel passes Round 9A audit with verdict SUITABLE
+2. Unified baseline (original 13-cell grid) re-run on clean data
+3. Baseline clears acceptance gate incl. wired DSR/PBO (O-03 closed)
+4. Promotion pre-registered as trial N=14; Bonferroni threshold recomputed (~2.91)
+
+If baseline fails on clean data: this hypothesis stays parked permanently.
+Adding parameters to a failing hypothesis family is not a remedy.

@@ -14,7 +14,9 @@ or authority to enter the portfolio decision/execution path.
 
 Persistence is an append-only SHA-256 hash chain. It detects accidental or
 partial changes; it is not an authenticated signature against an adversary
-who can rewrite the entire file. Use one writer process per queue file.
+who can rewrite the entire file. On POSIX, an advisory flock plus a
+read-before-write head check make concurrent writers fail closed rather than
+fork the chain; the single-writer-per-file contract is still recommended.
 """
 from __future__ import annotations
 
@@ -23,6 +25,10 @@ import json
 import math
 import os
 import re
+try:
+    import fcntl as _fcntl
+except ImportError:  # Windows: no advisory flock; single-writer contract applies
+    _fcntl = None
 import threading
 from dataclasses import asdict, dataclass
 from datetime import datetime, timedelta, timezone
@@ -450,6 +456,20 @@ class ResearchQueue:
         self._events, self._candidates = events, candidates
         self._statuses, self._screens = statuses, screens
 
+    def _disk_chain_state(self) -> tuple[int, str]:
+        """Count and head hash of the on-disk chain (read under the write lock)."""
+        if not self.path.exists():
+            return 0, GENESIS
+        lines = self.path.read_text(encoding="utf-8").splitlines()
+        if not lines:
+            return 0, GENESIS
+        try:
+            last = json.loads(lines[-1])
+            head = last["hash"]
+        except (json.JSONDecodeError, KeyError, TypeError) as exc:
+            raise QueueIntegrityError("on-disk queue tail is unreadable") from exc
+        return len(lines), head
+
     def _append(self, kind: str, payload: dict[str, Any], now: datetime) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         previous = self._events[-1]["hash"] if self._events else GENESIS
@@ -461,6 +481,15 @@ class ResearchQueue:
         encoded = (_canonical(record) + "\n").encode("utf-8")
         fd = os.open(self.path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
         try:
+            if _fcntl is not None:
+                _fcntl.flock(fd, _fcntl.LOCK_EX)
+            # Fail closed if another writer advanced (or truncated) the chain
+            # since this instance loaded it. Prevents multi-process chain forks.
+            n_disk, head_disk = self._disk_chain_state()
+            if n_disk != len(self._events) or head_disk != previous:
+                raise QueueIntegrityError(
+                    "stale queue writer: on-disk chain diverged; reload before appending"
+                )
             offset = 0
             while offset < len(encoded):
                 written = os.write(fd, encoded[offset:])
@@ -469,6 +498,8 @@ class ResearchQueue:
                 offset += written
             os.fsync(fd)
         finally:
+            if _fcntl is not None:
+                _fcntl.flock(fd, _fcntl.LOCK_UN)
             os.close(fd)
         self._events.append(record)
 

@@ -15,7 +15,6 @@ import numpy as np
 import pandas as pd
 from pathlib import Path
 
-# Ensure we can import from the repo root
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from quant_m1.data.freeze import load_frozen
@@ -50,14 +49,11 @@ def run_falsification():
     gross_returns = (weights.shift(1) * daily_returns).sum(axis=1)
 
     # 5. Apply transaction costs
-    # Calculate daily turnover (sum of absolute weight changes)
     turnover = weights.diff().abs().sum(axis=1).fillna(0.0)
     annual_turnover = turnover.sum() / (len(prices) / 252)
 
-    # Assume 3 bp one-way cost (conservative based on cost_attribution)
     cost_bps = 3.0
     daily_costs = turnover * (cost_bps / 10_000.0)
-
     net_returns = gross_returns - daily_costs
 
     # 6. Calculate metrics
@@ -66,23 +62,25 @@ def run_falsification():
     ann_vol = net_returns.std() * np.sqrt(252)
     net_sharpe = ann_net_return / ann_vol if ann_vol > 0 else 0.0
 
-    # Max Drawdown
     cum_returns = (1 + net_returns).cumprod()
     running_max = cum_returns.cummax()
     drawdown = (cum_returns - running_max) / running_max
     max_dd = drawdown.min()
 
-    # Deflated Sharpe Ratio (assuming 14 total trials now: 13 momentum + 1 TSMOM)
+    # 7. Compute DSR — returns a dict, extract 'dsr' key
     n_trials = 14
-    dsr = deflated_sharpe(
-        net_sharpe,
-        n_trials,
+    n_obs = len(net_returns.dropna())
+    dsr_result = deflated_sharpe(
+        sr_ann=net_sharpe,
+        n_obs=n_obs,
+        n_trials=n_trials,
         skew=float(net_returns.skew()),
-        kurtosis=float(net_returns.kurtosis()),
-        years=10.0,
+        kurtosis_raw=float(net_returns.kurtosis()),
+        periods_per_year=252,
     )
+    dsr = dsr_result["dsr"]
 
-    # 7. Print Results
+    # 8. Print Results
     print("\n" + "=" * 70)
     print("RESULTS")
     print("=" * 70)
@@ -92,16 +90,18 @@ def run_falsification():
     print(f"Net Sharpe Ratio:        {net_sharpe:.3f}")
     print(f"Max Drawdown:            {max_dd * 100:.2f}%")
     print(f"Annualized Turnover:     {annual_turnover:.2f}x")
+    print(f"Observations (n_obs):    {n_obs}")
     print(f"Deflated Sharpe (N=14):  {dsr:.4f}")
+    print(f"SR Hurdle (annualised):  {dsr_result['sr_hurdle_annualised']:.3f}")
 
-    # 8. Apply Kill Criteria
+    # 9. Apply Kill Criteria
     print("\n" + "=" * 70)
     print("KILL CRITERIA GATE")
     print("=" * 70)
 
     passed_dsr = dsr >= 0.95
     passed_sharpe = net_sharpe >= 0.10
-    passed_dd = max_dd >= -0.25  # Max 25% drawdown
+    passed_dd = max_dd >= -0.25
 
     print(f"1. DSR >= 0.95:        {'PASS' if passed_dsr else 'FAIL'} ({dsr:.4f})")
     print(f"2. Net Sharpe >= 0.10: {'PASS' if passed_sharpe else 'FAIL'} ({net_sharpe:.3f})")

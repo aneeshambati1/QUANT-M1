@@ -8,7 +8,7 @@ from .core import (Store, EventLog, Ledger, VerifiedState, Clock, ConfigAuthorit
                    ImmutableFloor, Mandate, Operational, Instrument)
 from .flags import Flags
 from .venue import MockVenue
-from .authority import Kernel, Gateway
+from .authority import Kernel, Gateway, OperatorConsole
 
 
 def build(tmpdir: str, cash: int = 10_000_000, positions=None, marks=None,
@@ -59,12 +59,15 @@ def build(tmpdir: str, cash: int = 10_000_000, positions=None, marks=None,
     lock = threading.RLock()
 
     kernel = Kernel(key, cfg, instruments, scenarios, lock=lock)
+    operator = OperatorConsole()
     gw = Gateway(key, cfg, ledger, log, venue, clock, instruments, scenarios,
                  flags, wd, lock=lock, flags_store=flags_store)
     gw.restore_flags()
+    if gw._operator_hash is None:
+        gw.register_operator(operator.current_hash())
     ledger.persist()
 
     return {"cfg": cfg, "ledger": ledger, "log": log, "clock": clock, "venue": venue,
             "flags": flags, "kernel": kernel, "gw": gw, "instruments": instruments,
             "scenarios": scenarios, "wd": wd, "lock": lock, "key": key,
-            "flags_store": flags_store}
+            "flags_store": flags_store, "operator": operator}

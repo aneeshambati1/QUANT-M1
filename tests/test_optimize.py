@@ -28,11 +28,15 @@ def test_zero_cost_trades_toward_signal():
 
 
 def test_cost_reduces_turnover():
+    # risk_aversion=4 keeps the free solution INTERIOR (w* = mu/(lambda*sigma^2)
+    # = 0.625 < 1), so cost can actually reduce turnover. The previous fixture
+    # saturated the gross cap (both solutions = 1.0) and could not demonstrate
+    # the invariant. This is a stronger test of the intended behaviour.
     mu = np.array([0.05, 0.03])
     cov = np.eye(2) * 0.02
     w0 = np.array([0.0, 0.0])
-    free = solve_cost_aware(mu, cov, w0, np.array([0.0, 0.0]))
-    costly = solve_cost_aware(mu, cov, w0, np.array([200.0, 200.0]))
+    free = solve_cost_aware(mu, cov, w0, np.array([0.0, 0.0]), risk_aversion=4.0)
+    costly = solve_cost_aware(mu, cov, w0, np.array([200.0, 200.0]), risk_aversion=4.0)
     assert costly.turnover < free.turnover
 
 

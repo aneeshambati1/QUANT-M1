@@ -1,6 +1,6 @@
 # QUANT-M1 Defect Register
 
-Audit baseline: HEAD `822c67fa6477027d2769fc7745de4cdee0d0996a` (branch `main`).
+Audit baseline: HEAD `c4f69ab982999f993be1c50f27d825372d7b669b` (branch `main`).
 Scope: PAPER / RESEARCH ONLY. US-listed liquid ETFs, long-only, unleveraged, USD, T+1.
 
 Status legend:
@@ -8,7 +8,16 @@ Status legend:
 - Delivered = complete file provided in the audit response; commit it to close.
 - Open = known gap requiring design approval, external validation, or operations.
 
-## A. Closed defects (Fixed+Applied at HEAD; full suite 393 passed)
+TEST-COUNT POLICY: markdown test counts are NOT authoritative. The authoritative
+result is the GitHub Actions `tests` workflow run at the current HEAD. Earlier
+figures (293 in RESULTS.md; 393 in this register at baseline 822c67f) were verified
+at their own commits and do not establish the result at later HEADs. At baseline
+c4f69ab9 with the corrected tests/test_paper_loop.py delivered below, the full
+suite was executed in-sandbox: 409 passed / 0 failed. The first CI run at c4f69ab9
+was RED solely because of the flawed restart test (see R6-04); committing the
+corrected test turns it green.
+
+## A. Closed defects (Fixed+Applied at HEAD)
 
 | ID | File / function | Severity | Failure scenario | Correction | Proving test |
 |----|-----------------|----------|------------------|------------|--------------|
@@ -36,19 +45,27 @@ Status legend:
 | D-17 | research/night_shift.py _append | Low | multi-process chain fork/truncation | flock + read-before-write head check | test_night_shift_concurrency |
 | R2-01 | orchestrator/cycle.py | Critical | HEAD abb1b85 truncated file (SyntaxError) | full restore (now present at HEAD) | all orchestrator tests import |
 
-## B. Delivered this round (commit to close)
+## B. Round-3 test files (now Fixed+Applied at HEAD)
 
 | ID | File | Severity | Issue | Status |
 |----|------|----------|-------|--------|
-| R3-01 | tests/test_latch_integrity.py | High | old file calls removed operator API (8 failures at HEAD-as-is) | Delivered — rewrite |
-| R3-02 | tests/test_optimize.py | Med | saturating fixture (1 failure at HEAD-as-is) | Delivered — fixture fix |
-| R3-03 | tests/test_authority_integrity.py | High | missing B1/B2/B3 + NaN coverage | Delivered — new |
-| R3-04 | tests/test_reconciliation_redteam.py | High | missing fill-ahead / unexpected-venue coverage | Delivered — new |
-| R3-05 | tests/test_pit_adversarial.py | Med | missing PIT adversarial coverage | Delivered — new |
-| R3-06 | tests/test_allocation_hardening.py | Med | missing allocation fail-closed coverage | Delivered — new |
-| R3-07 | docs/DEFECT_REGISTER.md | Low | register absent | Delivered — this file |
+| R3-01 | tests/test_latch_integrity.py | High | old file called removed operator API | Fixed+Applied — rewrite |
+| R3-02 | tests/test_optimize.py | Med | saturating fixture | Fixed+Applied — fixture fix |
+| R3-03 | tests/test_authority_integrity.py | High | missing B1/B2/B3 + NaN coverage | Fixed+Applied — new |
+| R3-04 | tests/test_reconciliation_redteam.py | High | missing fill-ahead / unexpected-venue coverage | Fixed+Applied — new |
+| R3-05 | tests/test_pit_adversarial.py | Med | missing PIT adversarial coverage | Fixed+Applied — new |
+| R3-06 | tests/test_allocation_hardening.py | Med | missing allocation fail-closed coverage | Fixed+Applied — new |
+| R3-07 | docs/DEFECT_REGISTER.md | Low | register absent | Fixed+Applied — this file |
 
-After committing B, the full suite is 393 passed / 0 failed (verified in sandbox).
+## R6. Paper-loop integration defects (cross-review found; confirmed + corrected)
+
+| ID | File / function | Severity | Failure scenario | Correction | Proving test | Status |
+|----|-----------------|----------|------------------|------------|--------------|--------|
+| R6-01 | paper_loop.run_paper_step | High | Shared Clock not advanced; kernel rejected every order STALE_MARKS (reproduced: 0 submitted / 3 rejected) | _advance_session catches clock up to mark wall under lock | test_successful_order_reaches_fill_and_reconciles | Fixed+Applied |
+| R6-02 | paper_loop / core.advance_session | High | Session persisted to ledger.json but not the signed composite; restart could roll session back | coordinated transition appends SESSION_ADVANCE + gw._persist(); idempotent re-run | test_restart_continuity_keeps_session; test_same_session_rerun_is_idempotent | Fixed+Applied |
+| R6-03 | paper_loop fill loop | High | venue.fill is incremental; passing full qty crashes on partial fills; fills counted without outcome check | fill by o.remaining; check gw.process outcome; fail closed | test_partial_fill_completes_on_next_step | Fixed+Applied |
+| R6-04 | tests/test_paper_loop.py::test_restart_continuity_keeps_session | Med | Asserted continued trading after a naive restart; mock venue reuses exec_ids so gateway correctly latches EXEC_ID_PAYLOAD_CONFLICT. First CI run RED on this test only | test corrected to assert session durability + fail-closed on exec-id conflict (the guaranteed behaviour) | itself | Delivered — commit to turn CI green |
+| R6-05 | CI absent | Med | No executed test result at HEAD | .github/workflows/tests.yml added | workflow run | Fixed+Applied (first run red pending R6-04) |
 
 ## C. Open items (require approval / external validation — NOT silently patched)
 
@@ -60,7 +77,11 @@ After committing B, the full suite is 393 passed / 0 failed (verified in sandbox
 | O-04 | Regime classifier calibration | Med | state.py thresholds are declared POLICY assumptions, correlation-only | pre-registered calibration study; multi-signal regime (vol/liquidity/breadth) |
 | O-05 | Stress scenario set | Med | system.py scenarios are static (max -10%); tail gaps beyond set | owner-approved scenario governance incl. crash/correlation-spike/liquidity-dry |
 | O-06 | Adaptive decay / change detection | Low | fixed EWMA half-life lags regime shifts | pre-registered experiment: bounded change-detection -> forced re-probation |
-| O-07 | Autonomous paper-loop runner | Med | no end-to-end daemon wiring data->cycle->dispatch->fills->contribution | design approval: shadow baseline book for marginal contribution; then implement |
+| O-07 | Autonomous paper-loop runner | Med | single-step function exists; no scheduled data->decision->execution->reconciliation->learning daemon | design approval: shadow baseline + venue reconciliation on restart; then implement |
+| O-08 | Restart venue reconciliation | Med | mock venue reuses exec_ids on rebuild; continued trading after restart needs persistent broker exec_ids + gw.recover() | venue adapter with durable exec_id sequence; reconcile before resuming (part of O-07) |
+| O-09 | Per-model attribution | Med | paper loop returns one ensemble-vs-hold number; no per-model leave-one-out | pre-registered leave-one-out counterfactual books for per-model earned authority |
+| O-10 | AI audit-trail hardening | Low | ai_advisory logs plaintext; no hash-chain/lock/redaction; adversary fields loosely validated | hash-chained + locked + redacted audit log; strict adversary schema |
+| O-11 | Symbol-order interface enforcement | Low | allocation vector must match sorted price-symbol order by caller convention | enforce ordering in the interface, not by documentation |
 
 ## D. Research integrity (unchanged, do not rewrite)
 TSMOM falsification: 0 survivors / 13 trials remains INCONCLUSIVE under its protocol,
@@ -71,3 +92,4 @@ are not modified. Synthetic fixtures are never described as market validation.
 No claim of "unbreakable", production-readiness, or a profitable edge is made.
 The guarantee is fail-closed behaviour + bounded authority + tested invariants,
 not invulnerability. ~10% annualized net is a research objective, not a promise.
+The paper loop is a single-step component, not yet a complete autonomous system.

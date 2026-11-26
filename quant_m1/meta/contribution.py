@@ -27,6 +27,8 @@ def marginal_contribution(
 ) -> float:
     """Incremental after-cost contribution over the same horizon."""
     values = (with_model, without_model, cost_frac)
+    if any(isinstance(x, bool) or not isinstance(x, (int, float)) for x in values):
+        raise ValueError("contribution inputs must be real numbers")
     if not all(math.isfinite(x) for x in values):
         raise ValueError("contribution inputs must be finite")
     if cost_frac < 0:
@@ -63,8 +65,10 @@ class ContributionTracker:
     _lam: float = field(default=0.0, init=False, repr=False)
 
     def __post_init__(self) -> None:
-        if self.horizon_days < 1:
-            raise ValueError("horizon_days must be >= 1")
+        if (isinstance(self.horizon_days, bool)
+                or not isinstance(self.horizon_days, int)
+                or self.horizon_days < 1):
+            raise ValueError("horizon_days must be an integer >= 1")
         if not math.isfinite(self.kappa) or self.kappa < 0:
             raise ValueError("kappa must be finite and >= 0")
         if self.probation_obs < 1:
@@ -111,6 +115,9 @@ class ContributionTracker:
         if not math.isfinite(contribution):
             raise ValueError("contribution must be finite")
 
+        if horizon_days is not None and (
+                isinstance(horizon_days, bool) or not isinstance(horizon_days, int)):
+            raise ValueError("horizon_days must be an integer")
         observed_horizon = (
             self.horizon_days if horizon_days is None else horizon_days
         )
@@ -140,8 +147,8 @@ class ContributionTracker:
 
     def decay_idle(self, steps: int = 1) -> None:
         """Decay authority incrementally after the idle grace period."""
-        if steps < 0:
-            raise ValueError("steps must be >= 0")
+        if isinstance(steps, bool) or not isinstance(steps, int) or steps < 0:
+            raise ValueError("steps must be an integer >= 0")
         if self._retired or steps == 0:
             return
 
@@ -204,8 +211,10 @@ def weights(
             )
         selected_horizon = next(iter(horizons), None)
     else:
-        if horizon_days < 1:
-            raise ValueError("horizon_days must be >= 1")
+        if (isinstance(horizon_days, bool)
+                or not isinstance(horizon_days, int)
+                or horizon_days < 1):
+            raise ValueError("horizon_days must be an integer >= 1")
         selected_horizon = horizon_days
 
     selected = {

@@ -122,5 +122,11 @@ def load_frozen(out_dir: str, name: str) -> PricePanel:
         raise DataError("manifest symbols mismatch")
     if man["column_hashes"] != column_hashes(panel.close):
         raise DataError("manifest per-symbol hash mismatch")
+    if man["column_order"] != [str(c) for c in panel.close.columns]:
+        raise DataError("manifest column_order mismatch")
+    if str(man["start"]) != str(panel.close.index[0]):
+        raise DataError("manifest start mismatch")
+    if str(man["end"]) != str(panel.close.index[-1]):
+        raise DataError("manifest end mismatch")
 
     return panel

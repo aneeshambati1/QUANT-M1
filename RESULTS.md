@@ -1,7 +1,7 @@
 # QUANT-M1: Research & Infrastructure Memo
 
 **Date:** 2026-11-26  
-**Status:** NO TRADEABLE EDGE DEMONSTRATED. INFRASTRUCTURE COMPLETE.  
+**Status:** NO TRADEABLE EDGE DEMONSTRATED. INFRASTRUCTURE VALIDATED — PAPER / RESEARCH ONLY.  
 **Panel:** 10 ETFs (SPY, QQQ, IWM, EFA, EEM, TLT, IEF, GLD, USO, UUP), 2015-2024, Daily Closes.
 
 ---
@@ -10,7 +10,7 @@
 
 This project set out to build an institutional-grade, autonomous trading infrastructure and discover a cross-sectional momentum edge. 
 
-**The verdict:** The infrastructure was successfully built, validated by 293 passing tests and external red-team audits. However, the research phase yielded **zero survivors** across 13 pre-registered market trials. Subsequent power analysis proved the dataset and time horizon are fundamentally insufficient to detect realistic edge sizes. The search was halted based on pre-declared statistical stopping criteria, not frustration.
+**The verdict:** The infrastructure was successfully built, validated by an automated test suite and external red-team audits. The authoritative test count is the GitHub Actions `tests` workflow run at the current HEAD (414 passing at the verified commit); historical counts quoted in earlier memos are superseded. However, the research phase yielded **zero survivors** across 13 pre-registered market trials. Subsequent power analysis proved the dataset and time horizon are fundamentally insufficient to detect realistic edge sizes. The search was halted based on pre-declared statistical stopping criteria, not frustration.
 
 ## 2. The Core Finding: Inconclusive, Not Negative
 
@@ -62,21 +62,23 @@ Continuing to test new hypotheses on this specific dataset violates the project'
 2. **Regime Starvation:** 10 years contains too few independent volatility regimes to validate conditional-exposure strategies (e.g., volatility targeting).
 3. **Data Limitations:** The panel relies on back-adjusted, non-Point-In-Time (PIT) closes, introducing unavoidable survivorship and look-ahead biases that cannot be patched via software.
 
-## 6. Open Defects (Red Team Findings)
+## 6. Engineering Defect Status (Red Team Findings — updated)
 
-External adversarial audits identified architectural gaps that must be resolved before routing live capital:
+External adversarial audits identified architectural gaps. Current status at the verified HEAD:
 
-- **[P0] Operator Auth Bypass:** The divergence-clear signature is minted by the same Gateway instance that holds the key, defeating the separation of execution and operator identity.
-- **[P1] Execution State Machine:** The mock venue lacks a durable outbox and explicit `UNKNOWN` state for ambiguous broker timeouts.
-- **[P1] DSR Integration:** Deflated Sharpe Ratio (DSR) and Probability of Backtest Overfitting (PBO) exist in the codebase but are not wired into the primary trial acceptance gate.
-- **[P2] Horizon Mixing:** The `ContributionTracker` lacks a horizon field, allowing mixed-frequency model evaluations to contaminate the EWMA meta-weights.
+- **[P0] Operator Auth Bypass — RESOLVED.** Operator clearance now uses an independent one-time key hash chain (`OperatorConsole`); the Gateway stores only a hash and cannot self-clear. Proven by `test_latch_integrity`.
+- **[P1] Execution State Machine — PARTIALLY RESOLVED.** Explicit `UNKNOWN` state, timeout-stays-ambiguous, snapshot-authoritative fills and partial-fill handling are implemented and tested. A durable venue outbox and restart venue reconciliation (persistent broker exec_ids) remain open (register O-08).
+- **[P1] DSR Integration — OPEN.** DSR and PBO exist in the codebase but are not wired into the primary trial acceptance gate; they require a pre-registered return-series protocol (register O-03). Do not apply DSR to HAC t-stats.
+- **[P2] Horizon Mixing — RESOLVED.** `ContributionTracker` carries a fixed `horizon_days`; mixed-horizon weight resolution fails closed, and per-session attribution only updates horizon-1 trackers. Proven by `test_contribution_types` and the paper-loop driver tests.
+
+The paper loop now includes a coordinated, crash-safe session transition and a multi-session driver with per-model leave-one-out after-cost attribution (`run_paper_session`, `run_paper_sessions`). It remains a deterministic session driver, not a live scheduled daemon (register O-07).
 
 ## 7. Next Steps & Handoff
 
 This repository represents a complete, negative research result backed by production-grade plumbing. To advance from paper to live deployment, the following sequence is required:
 
 1. **Acquire PIT Data:** Replace yfinance with a survivorship-free, point-in-time OHLCV database.
-2. **Wire DSR/PBO:** Integrate the deflated Sharpe gate into `run_grid` to prevent multiple-testing artifacts.
+2. **Wire DSR/PBO:** Integrate the deflated Sharpe gate into the return-series acceptance protocol to prevent multiple-testing artifacts.
 3. **Expand Universe:** Move from 10 ETFs to 300+ equities to achieve the cross-sectional breadth required for the fundamental law of active management.
 4. **Broker Integration:** Replace `MockVenue` with a state-machine-driven adapter (e.g., Interactive Brokers) that handles partial fills and rejects.
 

@@ -4,6 +4,8 @@ Covariance estimation.
 Ledoit-Wolf identity target implemented explicitly.
 Constant-correlation target preserves individual variance structure better.
 Factor covariance for ETF factor models.
+
+Inputs must be finite; non-finite returns/factors are rejected fail-closed.
 """
 from __future__ import annotations
 
@@ -17,6 +19,10 @@ def ledoit_wolf_identity(X: np.ndarray) -> tuple[np.ndarray, float]:
     Returns (Sigma_shrunk, shrinkage_intensity).
     """
     X = np.asarray(X, dtype=float)
+    if X.ndim != 2:
+        raise ValueError("X must be 2D (n_samples, n_features)")
+    if not np.all(np.isfinite(X)):
+        raise ValueError("X must be finite")
     n, p = X.shape
     if n < 2 or p < 1:
         raise ValueError("need n>=2, p>=1")
@@ -42,6 +48,10 @@ def ledoit_wolf_constant_correlation(X: np.ndarray) -> tuple[np.ndarray, float]:
     Preserves individual variances.
     """
     X = np.asarray(X, dtype=float)
+    if X.ndim != 2:
+        raise ValueError("X must be 2D (n_samples, n_features)")
+    if not np.all(np.isfinite(X)):
+        raise ValueError("X must be finite")
     n, p = X.shape
     if n < 2 or p < 2:
         raise ValueError("need n>=2, p>=2")
@@ -76,11 +86,16 @@ def factor_covariance(
     OLS factor covariance: B Cov_f B' + diagonal residual variance.
     returns: T x p
     factors: T x k
+
+    B is the (p x k) matrix of asset loadings on the k factors, so the
+    systematic covariance B Cov_f B' is (p x p).
     """
     R = np.asarray(returns, dtype=float)
     F = np.asarray(factors, dtype=float)
     if R.ndim != 2 or F.ndim != 2 or len(R) != len(F):
         raise ValueError("shape mismatch")
+    if not np.all(np.isfinite(R)) or not np.all(np.isfinite(F)):
+        raise ValueError("returns and factors must be finite")
     T, p = R.shape
     k = F.shape[1]
     if T <= k + 1:
@@ -89,7 +104,7 @@ def factor_covariance(
     F1 = np.column_stack([np.ones(T), F])
     beta = np.linalg.lstsq(F1, R, rcond=None)[0]
     resid = R - F1 @ beta
-    cov_f = np.cov(F.T, bias=True)
-    B = beta[1:]
+    cov_f = np.atleast_2d(np.cov(F.T, bias=True))
+    B = beta[1:].T
     D = np.diag(np.var(resid, axis=0, ddof=k + 1))
     return B @ cov_f @ B.T + D

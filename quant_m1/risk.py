@@ -9,8 +9,12 @@ Changes over M1.4:
   - Hard floors (short reachable, negative settled cash, non-positive NAV)
     are NEVER exempted.
 
-usage(), simulate(), CONSTRAINTS, LOSS_CONSTRAINTS, and is_risk_reducing()
-are unchanged from M1.4 so that reference.py's oracle stays valid.
+M1.7: simulate() validates that all state money/share/mark values are integers
+(rejecting bool/float/NaN) so non-finite inputs fail closed via evaluate()'s
+INVALID_RISK_INPUT path instead of silently passing NaN comparisons.
+
+usage(), CONSTRAINTS, LOSS_CONSTRAINTS, and is_risk_reducing() are unchanged
+from M1.4 so that reference.py's oracle stays valid.
 """
 from __future__ import annotations
 
@@ -30,9 +34,25 @@ class SimState:
     marks: dict[str, Money]
 
 
+def _is_int(x) -> bool:
+    return isinstance(x, int) and not isinstance(x, bool)
+
+
+def _validate_state_ints(base: VerifiedState) -> None:
+    if not _is_int(base.cash_settled):
+        raise ValueError("cash_settled must be integer cents")
+    if any(not _is_int(c) for _, c in base.receivables):
+        raise ValueError("receivable amounts must be integer cents")
+    if any(not _is_int(q) for q in base.positions.values()):
+        raise ValueError("positions must be integer shares")
+    if any(not _is_int(m) for m in base.marks.values()):
+        raise ValueError("marks must be integer cents")
+
+
 def simulate(base: VerifiedState, orders: tuple[WorkingOrder, ...],
              nums: tuple[int, ...], den: int, instruments: dict[str, Instrument],
              settle_lag: int) -> SimState:
+    _validate_state_ints(base)
     if den <= 0 or len(nums) != len(orders) or any(n < 0 or n > den for n in nums):
         raise ValueError("invalid fill-fraction vector")
     if settle_lag < 1:

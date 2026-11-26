@@ -1,4 +1,4 @@
-"""M1.3 permission flags. killed/frozen are additive and default False."""
+"""M1 permission flags and independent recovery monitor."""
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -20,22 +20,31 @@ class Flags:
     def permissions(self) -> frozenset[str]:
         if self.killed:
             return frozenset()
-        p = set(PERMS)
+
+        permissions = set(PERMS)
+
         if self.frozen:
-            p -= {"NEW_RISK", "SUBMIT"}
+            permissions -= {"NEW_RISK", "SUBMIT"}
+
         if self.data != "OK":
-            p -= {"NEW_RISK"}
+            permissions -= {"NEW_RISK"}
+
         if self.model != "OK":
-            p -= {"NEW_RISK", "RECOVER_AUTO"}
+            permissions -= {"NEW_RISK", "RECOVER_AUTO"}
+
         if self.exec != "OK":
-            p -= {"NEW_RISK", "SUBMIT", "RECOVER_AUTO"}
+            permissions -= {"NEW_RISK", "SUBMIT", "RECOVER_AUTO"}
+
         if self.envelope in {"EMPTY", "OVERFLOW"}:
-            p -= {"NEW_RISK"}
+            permissions -= {"NEW_RISK"}
+
         if self.governance != "OK":
-            p -= {"NEW_RISK", "SUBMIT", "RECOVER_AUTO"}
+            permissions -= {"NEW_RISK", "SUBMIT", "RECOVER_AUTO"}
+
         if self.market == "RESTRICTED":
-            p -= {"NEW_RISK"}
-        return frozenset(p)
+            permissions -= {"NEW_RISK"}
+
+        return frozenset(permissions)
 
 
 @dataclass(frozen=True)
@@ -49,9 +58,24 @@ class Monitor:
     authority: str
 
     def qualifies_for_recovery(self) -> bool:
-        need = ("data", "compute", "config", "authority")
-        return all(getattr(self, d) == "INDEPENDENT" for d in need)
+        """Every required monitor must independently report healthy status."""
+        required = (
+            "data",
+            "compute",
+            "config",
+            "clock",
+            "infra",
+            "authority",
+        )
+        return all(
+            getattr(self, component) == "INDEPENDENT"
+            for component in required
+        )
 
 
 def may_auto_recover(mon: Monitor, flags: Flags) -> bool:
-    return mon.qualifies_for_recovery() and "RECOVER_AUTO" in flags.permissions()
+    """Recovery is allowed only when monitoring and permission checks agree."""
+    return (
+        mon.qualifies_for_recovery()
+        and "RECOVER_AUTO" in flags.permissions()
+    )

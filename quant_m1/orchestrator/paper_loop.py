@@ -4,11 +4,19 @@ A scheduler calls run_paper_step once per exchange session. It never bypasses
 the Risk Kernel: every order passes Kernel.authorize + Gateway.submit, and a
 divergence latch blocks new risk. PAPER / RESEARCH ONLY.
 
+SESSION TRANSITION (coordinated, crash-safe, idempotent):
+  Under the shared lock this step (1) catches the shared Clock up to the new
+  mark wall, (2) advances the ledger session (settles matured receivables),
+  (3) appends a SESSION_ADVANCE audit event, and (4) re-persists the Gateway's
+  signed composite. Because the composite is the authoritative restore source,
+  persisting it in the same locked transition prevents a restart from rolling
+  the session back. Re-running the same target session is a no-op (idempotent).
+
 CONTRIBUTION CONVENTION (pre-registered default; owner may amend):
   Shadow baseline = BUY-AND-HOLD counterfactual (same starting book, no trades,
   no costs). Both books are marked with the SAME new marks.
 
-    starting_nav   = ledger NAV at old marks (before session advance)
+    starting_nav   = ledger NAV at old marks (before the session advance)
     baseline_after = starting positions * new_marks + starting cash-equivalent
     model_after    = ledger NAV at new marks, after trading + fills + settlement
     ensemble_contribution = (model_after - baseline_after) / starting_nav
@@ -17,6 +25,11 @@ CONTRIBUTION CONVENTION (pre-registered default; owner may amend):
   This is the incremental after-cost value of trading over holding. Per-model
   leave-one-out attribution is a documented next step; this function does not
   fabricate per-model numbers.
+
+FILL MODEL: venue.fill takes an INCREMENTAL quantity, so the step fills each
+venue-known working order by its REMAINING quantity and checks the Gateway's
+processing outcome. Unconfirmed/blocked outcomes stop the fill loop (fail
+closed); only accepted fills are counted.
 
 FAIL-CLOSED: no allocation or a policy block => no orders. A divergence latch
 returns a blocked report and does not learn from unverified fills.
@@ -27,8 +40,10 @@ from dataclasses import dataclass, field
 from typing import Callable, Mapping, Optional
 
 from ..meta.state import MarketState
-from .cycle import run_cycle
+from .cycle import run_cycle, apply_realized
 from .execution import generate_intents, dispatch_intents
+
+_ACCEPTED_FILL = frozenset({"APPLIED", "SNAPSHOT_RECONCILED"})
 
 
 @dataclass
@@ -73,6 +88,35 @@ def _cash_equivalent(ledger) -> int:
     return ledger.state.cash_settled + ledger.state.receivable_total()
 
 
+def _advance_session(sx, new_trade_date: int, new_mark_wall: int,
+                     new_marks: Mapping[str, int]) -> None:
+    """Coordinated clock + ledger + signed-composite session transition."""
+    ledger, gw, clock = sx["ledger"], sx["gw"], sx["clock"]
+    with sx["lock"]:
+        # Restart safety: the shared clock may lag the restored mark wall.
+        if clock.wall < ledger.state.mark_wall:
+            clock.advance_wall(ledger.state.mark_wall - clock.wall)
+
+        if ledger.state.trade_date == new_trade_date:
+            if (ledger.state.mark_wall != new_mark_wall
+                    or dict(ledger.state.marks) != dict(new_marks)):
+                raise ValueError("SESSION_CONFLICT: same date, different marks/wall")
+            return  # idempotent re-run of an already-applied session
+
+        if new_trade_date <= ledger.state.trade_date:
+            raise ValueError("SESSION_REGRESSION_OR_STASIS")
+        if new_mark_wall < ledger.state.mark_wall:
+            raise ValueError("MARK_WALL_REGRESSION")
+
+        if clock.wall < new_mark_wall:
+            clock.advance_wall(new_mark_wall - clock.wall)
+        ledger.advance_session(new_trade_date, new_mark_wall, dict(new_marks))
+        gw.log.append("SESSION_ADVANCE",
+                      {"trade_date": new_trade_date, "mark_wall": new_mark_wall},
+                      clock.next())
+        gw._persist()
+
+
 def run_paper_step(
     sx: Mapping,
     market_state: MarketState,
@@ -100,13 +144,13 @@ def run_paper_step(
     instruments = sx["instruments"]
 
     if gw._divergence_latched:
+        nav = ledger.state.nav()
         return PaperStepReport(
             trade_date=new_trade_date, action="latch_freeze",
             rule_id="R1_EXECUTION_DIVERGENT", permits_new_risk=False,
             intents_generated=0, intents_submitted=0, intents_rejected=0,
-            filled_orders=0, starting_nav=ledger.state.nav(),
-            baseline_after=ledger.state.nav(), model_after=ledger.state.nav(),
-            ensemble_contribution=0.0, blocked=True,
+            filled_orders=0, starting_nav=nav, baseline_after=nav,
+            model_after=nav, ensemble_contribution=0.0, blocked=True,
             note="Divergence latched; no new risk, no learning.",
         )
 
@@ -126,8 +170,7 @@ def run_paper_step(
         qty * new_marks[sym] for sym, qty in starting_positions.items() if qty
     )
 
-    # Single session-advance authority: settles matured receivables, marks peak.
-    ledger.advance_session(new_trade_date, new_mark_wall, dict(new_marks))
+    _advance_session(sx, new_trade_date, new_mark_wall, new_marks)
 
     rec = run_cycle(market_state, trackers, forecasts=forecasts, allocator=allocator)
 
@@ -149,18 +192,23 @@ def run_paper_step(
         rejected = report.intents_rejected
         reasons = list(report.rejection_reasons)
 
-        # Paper fill model: fully fill every venue-known working order at its
-        # limit price, then process through the Gateway (snapshot-authoritative).
+        # Paper fill model: fill each venue-known working order by its REMAINING
+        # quantity (venue.fill is incremental) and verify the Gateway outcome.
         snap = venue.snapshot() or {}
         venue_orders = snap.get("orders", {})
         for o in list(ledger.state.working):
             if o.terminal or o.remaining <= 0:
                 continue
-            if o.order_id not in venue_orders:
+            vo = venue_orders.get(o.order_id)
+            if vo is None or vo["cum_qty"] >= o.qty:
                 continue
-            ev = venue.fill(o.order_id, o.qty, price=o.price)
-            gw.process(ev)
-            filled += 1
+            ev = venue.fill(o.order_id, o.remaining, price=o.price)
+            outcome = gw.process(ev)
+            if outcome in _ACCEPTED_FILL:
+                filled += 1
+            else:
+                note = f"fill processing outcome: {outcome}"
+                break  # fail closed on unconfirmed/blocked fills
 
     model_after = ledger.state.nav()
     contribution = (model_after - baseline_after) / starting_nav
@@ -178,8 +226,6 @@ def run_paper_step(
         )
 
     if attribution is not None:
-        from ..meta.contribution import weights as _w  # noqa: F401
-        from ..orchestrator.cycle import apply_realized
         apply_realized(trackers, dict(attribution(contribution)))
 
     return PaperStepReport(

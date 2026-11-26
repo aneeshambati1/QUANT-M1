@@ -1,5 +1,5 @@
 """
-T+1 settlementsettlement book for QUANT-M1.
+T+1 settlement book for QUANT-M1.
 
 This module is intentionally independent of strategy logic.
 It enforces:
@@ -33,6 +33,8 @@ class PendingSettlement:
     def __post_init__(self) -> None:
         if not self.exec_id:
             raise ValueError("exec_id must be non-empty")
+        if isinstance(self.amount_minor, bool) or not isinstance(self.amount_minor, int):
+            raise ValueError("amount_minor must be an integer (minor units)")
         if self.amount_minor <= 0:
             raise ValueError("settlement amount must be positive")
         td = date.fromisoformat(self.trade_date)
@@ -82,6 +84,12 @@ class SettlementBook:
         self._released: Dict[str, PendingSettlement] = {}
 
         for p in pending:
+            if not isinstance(p, PendingSettlement):
+                raise ValueError("pending entries must be PendingSettlement")
+            if p.exec_id in self._seen:
+                if self._seen[p.exec_id] != p:
+                    raise ValueError(f"SETTLEMENT_EXEC_ID_CONFLICT: {p.exec_id}")
+                continue
             self._seen[p.exec_id] = p
             self._pending[p.exec_id] = p
 
@@ -92,6 +100,8 @@ class SettlementBook:
         net_proceeds_minor: int,
         currency: str = "USD",
     ) -> PendingSettlement:
+        if isinstance(net_proceeds_minor, bool) or not isinstance(net_proceeds_minor, int):
+            raise ValueError("net_proceeds_minor must be an integer (minor units)")
         if not self.calendar.is_session(trade_date):
             raise ValueError(f"trade_date {trade_date} is not an exchange session")
 
@@ -100,7 +110,7 @@ class SettlementBook:
             exec_id=exec_id,
             trade_date=trade_date,
             available_date=available,
-            amount_minor=int(net_proceeds_minor),
+            amount_minor=net_proceeds_minor,
             currency=currency,
         )
 

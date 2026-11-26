@@ -79,12 +79,19 @@ def test_restart_continuity_keeps_session(tmp_path):
     run_paper_step(sx, _state(), {"m1": _active()}, forecasts=_forecasts(),
                    new_trade_date=101, new_mark_wall=1_000_100,
                    new_marks=MARKS, allocator=solve_allocation)
-    sx2 = build(d, cash=2_000_000, positions={}, marks=MARKS)   # default clock
-    assert sx2["ledger"].state.trade_date == 101                # composite persisted
+    # R6-02: the session is restored from the signed composite, not rolled back.
+    sx2 = build(d, cash=2_000_000, positions={}, marks=MARKS)
+    assert sx2["ledger"].state.trade_date == 101
+    assert sx2["ledger"].state.mark_wall == 1_000_100
+    # A naive restart rebuilds the mock venue, which reuses exec_ids. The gateway
+    # must detect the exec_id payload conflict and FAIL CLOSED, not trade blindly.
+    # (Continued trading after restart requires venue reconciliation with
+    # persistent broker exec_ids — part of the open full-runner work O-07/O-08.)
     rep = run_paper_step(sx2, _state(), {"m1": _active()}, forecasts=_forecasts(),
                          new_trade_date=102, new_mark_wall=1_000_200,
                          new_marks=MARKS, allocator=solve_allocation)
-    assert rep.blocked is False and rep.intents_submitted > 0   # clock caught up
+    assert rep.blocked is True
+    assert rep.ensemble_contribution == 0.0
 
 
 def test_same_session_rerun_is_idempotent(tmp_path):

@@ -62,7 +62,7 @@ def test_composite_cannot_override_audit_latch(tmp_path):
     d = sx["gw"].composite_store.load()
     d["divergence_latched"] = False; d["flags"]["exec"] = "OK"
     body = {k: v for k, v in d.items() if k != "composite_sig"}
-    d["composite_sig"] = sign(sx["gw"].key, body)   # key-holder re-signs
+    d["composite_sig"] = sign(sx["gw"].key, body)
     sx["gw"].composite_store.save(d)
     sx2 = build(str(tmp_path))
     assert sx2["gw"]._divergence_latched is True
@@ -92,11 +92,7 @@ def test_clear_with_bad_signature_rejected(tmp_path):
                                   key_reveal=cmd["key_reveal"], next_hash=cmd["next_hash"],
                                   sig="deadbeef" * 8)
     assert e.value.code == "OPERATOR_BAD_SIGNATURE"
-    assert sx2_ok(sx)
-
-
-def sx2_ok(sx):
-    return sx["gw"]._divergence_latched is True
+    assert sx["gw"]._divergence_latched is True
 
 
 def test_clear_with_stale_seq_rejected(tmp_path):
@@ -155,7 +151,6 @@ def test_operator_body_is_canonical():
 
 
 def test_gateway_cannot_self_clear(tmp_path):
-    """P0: the Gateway exposes no minting helper and cannot forge a reveal."""
     sx = build(str(tmp_path)); sx["gw"].latch_divergence("FAULT")
     assert not hasattr(sx["gw"], "operator_clear_signature")
     with pytest.raises(Reject) as e:

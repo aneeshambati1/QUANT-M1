@@ -3,53 +3,57 @@
 Before 2024-05-28: US equity settlement was T+2.
 On and after 2024-05-28: US equity settlement is T+1.
 
-This module provides a single source of truth for settlement lag. 
-SETTLEMENT_DATE INVARIANT: cash from a sale is available on the first
-exchange session >= trade_date + settlement_lag(trade_date).
+SETTLEMENT_DATE INVARIANT: cash from a sale is available after settlement_lag
+EXCHANGE SESSIONS (XNYS), not calendar/business days. Weekends AND exchange
+holidays are skipped. A trade_date that is not an exchange session is rejected.
 """
 from __future__ import annotations
 
-import pandas as pd
 from datetime import date, datetime
+from functools import lru_cache
+
+import exchange_calendars as xcals
+import pandas as pd
 
 T1_TRANSITION = pd.Timestamp("2024-05-28").date()
 
 
-def settlement_lag(trade_date: date | datetime | pd.Timestamp) -> int:
-    """Return settlement lag in business days for the given trade date.
+@lru_cache(maxsize=1)
+def _calendar():
+    return xcals.get_calendar("XNYS")
 
-    Returns 2 before 2024-05-28, 1 on or after.
+
+def _to_date(value) -> date:
+    if isinstance(value, datetime):
+        return value.date()
+    if isinstance(value, date):
+        return value
+    return pd.Timestamp(value).date()
+
+
+def settlement_lag(trade_date) -> int:
+    """Return settlement lag in exchange sessions: 2 before 2024-05-28, else 1."""
+    return 1 if _to_date(trade_date) >= T1_TRANSITION else 2
+
+
+def settlement_date(trade_date) -> pd.Timestamp:
+    """First exchange session that is settlement_lag sessions after trade_date.
+
+    Rejects a trade_date that is not an XNYS session (weekend/holiday).
     """
-    if isinstance(trade_date, (datetime, pd.Timestamp)):
-        trade_date = trade_date.date() if hasattr(trade_date, 'date') else trade_date
-    if not isinstance(trade_date, date):
-        trade_date = pd.Timestamp(trade_date).date()
-
-    if trade_date >= T1_TRANSITION:
-        return 1
-    return 2
-
-
-def settlement_date(trade_date: date | datetime | pd.Timestamp) -> pd.Timestamp:
-    """Compute the settlement date for a trade executed on trade_date.
-
-    Uses standard US business days (skips weekends). Returns the first 
-    exchange session that is >= trade_date + settlement_lag business days.
-    """
-    if not isinstance(trade_date, pd.Timestamp):
-        td = pd.Timestamp(trade_date).normalize()
-    else:
-        td = trade_date.normalize()
-
-    lag = settlement_lag(td)
-    # bdate_range includes the start date. periods=lag+1 gives the lag-th 
-    # business day after the start date.
-    return pd.bdate_range(start=td, periods=lag + 1)[-1]
+    d = _to_date(trade_date)
+    ts = pd.Timestamp(d)
+    cal = _calendar()
+    if not cal.is_session(ts):
+        raise ValueError(f"trade_date {d.isoformat()} is not an XNYS exchange session")
+    cur = ts
+    for _ in range(settlement_lag(d)):
+        cur = cal.next_session(cur)
+    return pd.Timestamp(cur.date())
 
 
-def is_settled(trade_date: date | datetime | pd.Timestamp,
-               check_date: date | datetime | pd.Timestamp) -> bool:
-    """Return True if a trade executed on trade_date is settled by check_date."""
+def is_settled(trade_date, check_date) -> bool:
+    """True if a trade executed on trade_date is settled by check_date."""
     settle = settlement_date(trade_date)
-    check = pd.Timestamp(check_date).normalize()
+    check = pd.Timestamp(_to_date(check_date))
     return check >= settle

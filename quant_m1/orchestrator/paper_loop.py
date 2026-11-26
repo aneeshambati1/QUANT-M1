@@ -23,8 +23,7 @@ CONTRIBUTION CONVENTION (pre-registered default; owner may amend):
 
   The ledger already deducts costs on fills, so model_after is NET of costs.
   This is the incremental after-cost value of trading over holding. Per-model
-  leave-one-out attribution is a documented next step; this function does not
-  fabricate per-model numbers.
+  leave-one-out attribution is provided by run_paper_session below.
 
 FILL MODEL: venue.fill takes an INCREMENTAL quantity, so the step fills each
 venue-known working order by its REMAINING quantity and checks the Gateway's
@@ -36,6 +35,8 @@ returns a blocked report and does not learn from unverified fills.
 """
 from __future__ import annotations
 
+import shutil
+import tempfile
 from dataclasses import dataclass, field
 from typing import Callable, Mapping, Optional
 
@@ -237,3 +238,129 @@ def run_paper_step(
         ensemble_contribution=contribution, blocked=False,
         note=note, rejection_reasons=reasons,
     )
+
+
+# ---------------------------------------------------------------------------
+# Multi-session driver + per-model leave-one-out attribution (O-07 / O-09).
+#
+# ATTRIBUTION CONVENTION (pre-registered):
+#   Model m's 1-session marginal after-cost contribution is
+#       (NAV_full_ensemble - NAV_ensemble_without_m) / starting_NAV
+#   where the counterfactual "without m" is run in an ISOLATED shadow book that
+#   starts from the identical pre-session state and uses the identical config,
+#   marks, costs and allocator. Both books pay their own transaction costs, so
+#   the difference is net-of-cost. Leave-one-out contributions do NOT sum to the
+#   ensemble-vs-hold number (interaction effects); the ensemble-vs-hold figure
+#   remains the overall gate, while per-model LOO drives per-model authority.
+#   Only horizon_days==1 trackers are attributed per session; other horizons
+#   idle-decay (their measurement requires their own holding-period window).
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class PaperSessionReport:
+    step: PaperStepReport
+    contributions: dict
+    attributed: list
+
+    def as_dict(self) -> dict:
+        return {"step": self.step.as_dict(),
+                "contributions": dict(self.contributions),
+                "attributed": list(self.attributed)}
+
+
+def _shadow_system(real_sx, start: Mapping, tmpdir: str):
+    """Isolated counterfactual book faithful to the real pre-session state."""
+    from ..system import build as _build
+    sx = _build(tmpdir, cash=start["cash_settled"], positions=start["positions"],
+                marks=start["marks"], trade_date=start["trade_date"],
+                mark_wall=start["mark_wall"])
+    for comp in ("kernel", "gw"):
+        sx[comp].cfg = real_sx["cfg"]
+        sx[comp].instruments = real_sx["instruments"]
+        sx[comp].scenarios = real_sx["scenarios"]
+    sx["ledger"].state.receivables = tuple(start["receivables"])
+    sx["ledger"].state.peak_nav = start["peak_nav"]
+    return sx
+
+
+def run_paper_session(
+    sx: Mapping,
+    market_state: MarketState,
+    trackers: Mapping,
+    forecasts: Mapping,
+    *,
+    new_trade_date: int,
+    new_mark_wall: int,
+    new_marks: Mapping[str, int],
+    allocator: Callable,
+    min_trade_bps: int = 10,
+    cost_bps: int = 10,
+    attribute: bool = True,
+) -> PaperSessionReport:
+    """One real session step plus per-model leave-one-out attribution."""
+    ledger = sx["ledger"]
+    start = {
+        "cash_settled": ledger.state.cash_settled,
+        "positions": dict(ledger.state.positions),
+        "marks": dict(ledger.state.marks),
+        "receivables": tuple(ledger.state.receivables),
+        "peak_nav": ledger.state.peak_nav,
+        "trade_date": ledger.state.trade_date,
+        "mark_wall": ledger.state.mark_wall,
+    }
+    step = run_paper_step(sx, market_state, trackers, forecasts,
+                          new_trade_date=new_trade_date, new_mark_wall=new_mark_wall,
+                          new_marks=new_marks, allocator=allocator,
+                          min_trade_bps=min_trade_bps, cost_bps=cost_bps)
+    contributions: dict = {}
+    attributed: list = []
+    if attribute and not step.blocked and step.starting_nav > 0:
+        active = [name for name, t in trackers.items()
+                  if getattr(t, "eligible", False) and getattr(t, "horizon_days", 1) == 1]
+        for m in active:
+            without = {k: t for k, t in trackers.items() if k != m}
+            tmp = tempfile.mkdtemp(prefix="quant_shadow_")
+            try:
+                shadow = _shadow_system(sx, start, tmp)
+                sh = run_paper_step(shadow, market_state, without, forecasts,
+                                    new_trade_date=new_trade_date, new_mark_wall=new_mark_wall,
+                                    new_marks=new_marks, allocator=allocator,
+                                    min_trade_bps=min_trade_bps, cost_bps=cost_bps)
+                if not sh.blocked:
+                    contributions[m] = (step.model_after - sh.model_after) / step.starting_nav
+            finally:
+                shutil.rmtree(tmp, ignore_errors=True)
+        if contributions:
+            apply_realized(trackers, contributions, horizon_days=1)
+            attributed = list(contributions)
+    return PaperSessionReport(step=step, contributions=contributions, attributed=attributed)
+
+
+def run_paper_sessions(
+    sx: Mapping,
+    sessions,
+    trackers: Mapping,
+    *,
+    allocator: Callable,
+    min_trade_bps: int = 10,
+    cost_bps: int = 10,
+    attribute: bool = True,
+) -> list:
+    """Sequence paper sessions deterministically; stop fail-closed on a block.
+
+    ``sessions`` is an iterable of (market_state, forecasts, new_trade_date,
+    new_mark_wall, new_marks). Returns one PaperSessionReport per attempted
+    session. This is a deterministic session driver, not a live daemon; the
+    scheduled data->decision->execution->reconciliation loop remains O-07.
+    """
+    reports = []
+    for (market_state, forecasts, date, wall, marks) in sessions:
+        rep = run_paper_session(sx, market_state, trackers, forecasts,
+                                new_trade_date=date, new_mark_wall=wall, new_marks=marks,
+                                allocator=allocator, min_trade_bps=min_trade_bps,
+                                cost_bps=cost_bps, attribute=attribute)
+        reports.append(rep)
+        if rep.step.blocked:
+            break
+    return reports

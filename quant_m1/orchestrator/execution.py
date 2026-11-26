@@ -11,6 +11,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Mapping
 
+import numpy as np
+
 from ..allocate.engine import AllocationResult
 from ..authority import Intent, Kernel, Gateway, Reject
 from ..core import Ledger, Clock, Instrument
@@ -55,6 +57,18 @@ def generate_intents(allocation: AllocationResult,
     """
     if not allocation.solver_ok:
         return [], 0
+
+    w = np.asarray(allocation.weights, dtype=float)
+    if not np.all(np.isfinite(w)):
+        raise ValueError("allocation weights must be finite")
+    if np.any(w < -1e-9):
+        raise ValueError("allocation weights must be long-only")
+    if float(w.sum()) > 1.0 + 1e-6:
+        raise ValueError("allocation gross exposure must be <= 1")
+    if not isinstance(min_trade_bps, int) or min_trade_bps < 0:
+        raise ValueError("min_trade_bps must be a nonnegative integer")
+    if not isinstance(cost_bps, int) or not 0 <= cost_bps <= 10_000:
+        raise ValueError("cost_bps must be an integer in [0, 10000]")
 
     cash_equiv = ledger.state.cash_settled + ledger.state.receivable_total()
     pos_val = sum(q * ledger.state.marks[s]

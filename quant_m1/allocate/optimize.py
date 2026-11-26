@@ -12,6 +12,9 @@ cost exceeds their benefit. A per-asset no-trade band is applied afterward.
 FAIL-CLOSED VALIDATION: holding current weights is always feasible. If the
 solver returns an objective worse than holding, or violates constraints,
 the result is marked solver_ok=False and current weights are returned.
+
+MANDATE: max_gross is a CEILING in (0, 1]; it is not an investment target and
+can never authorise leverage. cash_frac is always 1 - invested_frac.
 """
 from __future__ import annotations
 
@@ -78,8 +81,12 @@ def solve_cost_aware(expected_returns, cov, current_weights, cost_bps,
         raise OptimizationError("shape mismatch")
     if not all(np.all(np.isfinite(a)) for a in (mu, C, w0, c)):
         raise OptimizationError("inputs must be finite")
-    if risk_aversion <= 0 or max_gross <= 0:
-        raise OptimizationError("risk_aversion and max_gross must be > 0")
+    if not np.isfinite(risk_aversion) or risk_aversion <= 0:
+        raise OptimizationError("risk_aversion must be finite and > 0")
+    if not np.isfinite(max_gross) or max_gross <= 0:
+        raise OptimizationError("max_gross must be finite and > 0")
+    if max_gross > 1.0:
+        raise OptimizationError("max_gross must be <= 1; leverage is prohibited")
     if np.any(c < 0):
         raise OptimizationError("cost_bps must be >= 0")
     if np.any(w0 < -tol) or w0.sum() > max_gross + tol:
@@ -128,20 +135,30 @@ def solve_cost_aware(expected_returns, cov, current_weights, cost_bps,
     band_applied = False
     if band_frac is not None:
         b = np.asarray(band_frac, dtype=float)
-        if b.shape != (n,) or np.any(b < 0):
-            raise OptimizationError("band_frac must be non-negative 1D of length n")
+        if b.shape != (n,) or np.any(b < 0) or not np.all(np.isfinite(b)):
+            raise OptimizationError("band_frac must be finite non-negative 1D of length n")
         snapped = np.where(np.abs(trades) < b, w0, w)
         if snapped.sum() <= max_gross + 1e-6:
-            w = snapped
-            trades = w - w0
-            band_applied = True
+            ct = snapped - w0
+            if obj(np.concatenate([snapped, np.abs(ct)])) <= hold_obj + 1e-7:
+                w = snapped
+                trades = ct
+                band_applied = True
+
+    final_obj = obj(np.concatenate([w, np.abs(trades)]))
+    if final_obj > hold_obj + 1e-7:
+        w = np.clip(w0, 0.0, None)
+        trades = w - w0
+        band_applied = False
+        ok = False
+        final_obj = obj(np.concatenate([w, np.abs(trades)]))
 
     invested = float(w.sum())
     turnover = float(np.abs(trades).sum())
     return CostAwareResult(
         weights=w, trades=trades, invested_frac=invested,
-        cash_frac=max_gross - invested,
+        cash_frac=1.0 - invested,
         expected_return=float(mu @ w), variance=float(w @ C @ w),
         cost_frac=float(c @ np.abs(trades)), turnover=turnover,
-        objective=obj(np.concatenate([w, np.abs(trades)])),
+        objective=final_obj,
         hold_objective=hold_obj, solver_ok=ok, band_applied=band_applied)

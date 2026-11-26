@@ -1,30 +1,16 @@
-"""Marginal after-cost contribution tracking and meta-weighting.
+"""Horizon-isolated marginal after-cost contribution tracking.
 
-Backward path of the bidirectional loop:
+Weights are earned from paired incremental contribution, not raw model PnL.
+Each tracker represents ONE model at ONE holding horizon.
 
-    forward:  weights -> allocation -> execution
-    backward: realized PnL -> marginal contribution -> EWMA mean/variance
-              -> lower confidence bound -> weights
-
-Exponential propagation is explicit and parameterised by half-life:
-
-    lambda = 1 - 2^(-1/h)
-    m_t    = (1-lambda) m_{t-1} + lambda c_t
-    v_t    = (1-lambda) v_{t-1} + lambda (c_t - m_{t-1})^2
-    LCB    = m_t - kappa sqrt(v_t)
-
-Weight is allocated only when LCB > 0 AND probation is cleared. A model with
-no demonstrated positive contribution receives zero weight.
-
-UNITS: fractional return per observation, net of cost. The caller must supply
-the same horizon for every model in a comparison set.
+Do not mix daily, weekly, or monthly observations in the same tracker.
 """
 from __future__ import annotations
 
 import math
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Dict, Mapping
+from typing import Dict, Mapping, Optional
 
 
 class ModelStatus(Enum):
@@ -34,19 +20,14 @@ class ModelStatus(Enum):
     RETIRED = "retired"
 
 
-def marginal_contribution(with_model: float,
-                          without_model: float,
-                          cost_frac: float) -> float:
-    """Incremental after-cost contribution of including a model.
-
-    with_model / without_model are realised fractional returns over the SAME
-    horizon and the SAME universe, differing only by inclusion of the model.
-    cost_frac is the incremental round-trip cost attributable to the model.
-
-    Paired difference, not raw return. A model earning 20bp while the book
-    would have earned 25bp without it has NEGATIVE contribution.
-    """
-    if not all(math.isfinite(x) for x in (with_model, without_model, cost_frac)):
+def marginal_contribution(
+    with_model: float,
+    without_model: float,
+    cost_frac: float,
+) -> float:
+    """Incremental after-cost contribution over the same horizon."""
+    values = (with_model, without_model, cost_frac)
+    if not all(math.isfinite(x) for x in values):
         raise ValueError("contribution inputs must be finite")
     if cost_frac < 0:
         raise ValueError("cost_frac must be >= 0")
@@ -54,18 +35,15 @@ def marginal_contribution(with_model: float,
 
 
 def _ewma_lambda(half_life_obs: float) -> float:
-    if half_life_obs <= 0 or not math.isfinite(half_life_obs):
+    if not math.isfinite(half_life_obs) or half_life_obs <= 0:
         raise ValueError("half_life_obs must be positive and finite")
     return 1.0 - math.pow(2.0, -1.0 / half_life_obs)
 
 
 @dataclass
 class ContributionTracker:
-    """Per-model exponentially-weighted contribution with confidence penalty.
+    """EWMA contribution tracker for one model and one fixed horizon."""
 
-    prior_std seeds variance so an unobserved model has LCB < 0 and therefore
-    zero weight. Authority must be earned, not assumed.
-    """
     half_life_obs: float = 60.0
     kappa: float = 1.0
     probation_obs: int = 30
@@ -74,26 +52,41 @@ class ContributionTracker:
     retire_band: float = 0.002
     idle_grace: int = 5
 
+    # Fixed return horizon represented by each observation.
+    horizon_days: int = 1
+
     mean: float = 0.0
-    var: float = field(default=0.0)
+    var: float = 0.0
     n: int = 0
     idle: int = 0
-    _retired: bool = field(default=False)
+    _retired: bool = field(default=False, init=False)
+    _lam: float = field(default=0.0, init=False, repr=False)
 
     def __post_init__(self) -> None:
-        if self.kappa < 0:
-            raise ValueError("kappa must be >= 0")
+        if self.horizon_days < 1:
+            raise ValueError("horizon_days must be >= 1")
+        if not math.isfinite(self.kappa) or self.kappa < 0:
+            raise ValueError("kappa must be finite and >= 0")
         if self.probation_obs < 1:
             raise ValueError("probation_obs must be >= 1")
-        if self.prior_std <= 0:
-            raise ValueError("prior_std must be > 0")
+        if not math.isfinite(self.prior_std) or self.prior_std <= 0:
+            raise ValueError("prior_std must be positive and finite")
         if self.retire_min_obs < self.probation_obs:
             raise ValueError("retire_min_obs must be >= probation_obs")
-        if self.retire_band <= 0:
-            raise ValueError("retire_band must be > 0")
+        if not math.isfinite(self.retire_band) or self.retire_band <= 0:
+            raise ValueError("retire_band must be positive and finite")
         if self.idle_grace < 0:
             raise ValueError("idle_grace must be >= 0")
+        if self.n < 0 or self.idle < 0:
+            raise ValueError("n and idle must be >= 0")
+        if not math.isfinite(self.mean):
+            raise ValueError("mean must be finite")
+        if not math.isfinite(self.var) or self.var < 0:
+            raise ValueError("var must be finite and >= 0")
+
         self._lam = _ewma_lambda(self.half_life_obs)
+
+        # Seed uncertainty so a new model cannot immediately earn authority.
         if self.var == 0.0:
             self.var = self.prior_std ** 2
 
@@ -103,52 +96,64 @@ class ContributionTracker:
 
     @property
     def lcb(self) -> float:
-        """Lower confidence bound. The only quantity that earns weight."""
         return self.mean - self.kappa * self.std
 
-    def update(self, contribution: float) -> None:
-        """Backward pass. One realised marginal after-cost observation."""
+    def update(
+        self,
+        contribution: float,
+        *,
+        horizon_days: Optional[int] = None,
+    ) -> None:
+        """Update with one paired, net-of-cost contribution observation."""
         if self._retired:
             return
+
         if not math.isfinite(contribution):
             raise ValueError("contribution must be finite")
-        prev_mean = self.mean
-        self.mean = (1.0 - self._lam) * prev_mean + self._lam * contribution
-        resid = contribution - prev_mean
-        self.var = (1.0 - self._lam) * self.var + self._lam * resid * resid
+
+        observed_horizon = (
+            self.horizon_days if horizon_days is None else horizon_days
+        )
+        if observed_horizon != self.horizon_days:
+            raise ValueError(
+                f"horizon mismatch: tracker={self.horizon_days}d, "
+                f"observation={observed_horizon}d"
+            )
+
+        previous_mean = self.mean
+        self.mean = (
+            (1.0 - self._lam) * previous_mean
+            + self._lam * contribution
+        )
+
+        residual = contribution - previous_mean
+        self.var = (
+            (1.0 - self._lam) * self.var
+            + self._lam * residual * residual
+        )
+
         self.n += 1
         self.idle = 0
+
         if self.n >= self.retire_min_obs and self.mean < -self.retire_band:
             self._retired = True
 
     def decay_idle(self, steps: int = 1) -> None:
-        """No permanent authority: silence decays weight toward zero.
-
-        Mean decays geometrically; variance is held, so the confidence penalty
-        increasingly dominates and LCB falls.
-
-        Grace accounting is INCREMENTAL. Only the portion of this call that
-        crosses beyond idle_grace decays. This makes repeated small calls
-        equivalent to one large call:
-
-            decay_idle(1) x 10  ==  decay_idle(10)
-
-        The earlier version recomputed the full past-grace span on every call,
-        which double-counted and over-decayed under repeated invocation.
-        """
+        """Decay authority incrementally after the idle grace period."""
         if steps < 0:
             raise ValueError("steps must be >= 0")
         if self._retired or steps == 0:
             return
-        prev_idle = self.idle
+
+        previous_idle = self.idle
         self.idle += steps
-        if self.idle <= self.idle_grace:
-            return
-        already_past = max(0, prev_idle - self.idle_grace)
-        now_past = self.idle - self.idle_grace
-        effective = now_past - already_past
-        if effective > 0:
-            self.mean *= math.pow(1.0 - self._lam, effective)
+
+        previous_past_grace = max(0, previous_idle - self.idle_grace)
+        current_past_grace = max(0, self.idle - self.idle_grace)
+        effective_steps = current_past_grace - previous_past_grace
+
+        if effective_steps > 0:
+            self.mean *= math.pow(1.0 - self._lam, effective_steps)
 
     @property
     def status(self) -> ModelStatus:
@@ -169,6 +174,7 @@ class ContributionTracker:
 
     def snapshot(self) -> dict:
         return {
+            "horizon_days": self.horizon_days,
             "n": self.n,
             "idle": self.idle,
             "mean": self.mean,
@@ -180,31 +186,78 @@ class ContributionTracker:
         }
 
 
-def weights(trackers: Mapping[str, ContributionTracker]) -> Dict[str, float]:
-    """Normalise raw LCB weights across the eligible set.
+def weights(
+    trackers: Mapping[str, ContributionTracker],
+    *,
+    horizon_days: Optional[int] = None,
+) -> Dict[str, float]:
+    """Normalize positive LCB weights within exactly one horizon.
 
-    Returns all-zero when no model is eligible. That is not a failure; it is
-    the correct answer. Cash is a position. The caller must not renormalise
-    an all-zero result into equal weights.
+    If tracker horizons differ, caller must explicitly select a horizon.
+    All-zero weights are preserved; do not convert them to equal weights.
     """
-    raw = {name: t.raw_weight() for name, t in trackers.items()}
+    if horizon_days is None:
+        horizons = {t.horizon_days for t in trackers.values()}
+        if len(horizons) > 1:
+            raise ValueError(
+                "mixed tracker horizons; pass horizon_days explicitly"
+            )
+        selected_horizon = next(iter(horizons), None)
+    else:
+        if horizon_days < 1:
+            raise ValueError("horizon_days must be >= 1")
+        selected_horizon = horizon_days
+
+    selected = {
+        name: tracker
+        for name, tracker in trackers.items()
+        if selected_horizon is None
+        or tracker.horizon_days == selected_horizon
+    }
+
+    raw = {name: tracker.raw_weight() for name, tracker in selected.items()}
     total = sum(raw.values())
+
     if total <= 0.0:
-        return {name: 0.0 for name in trackers}
-    return {name: v / total for name, v in raw.items()}
+        return {name: 0.0 for name in selected}
+
+    return {name: value / total for name, value in raw.items()}
 
 
-def authority_report(trackers: Mapping[str, ContributionTracker]) -> dict:
-    """Auditable snapshot. Every number carries its unit and convention."""
-    w = weights(trackers)
+def authority_report(
+    trackers: Mapping[str, ContributionTracker],
+    *,
+    horizon_days: Optional[int] = None,
+) -> dict:
+    selected_weights = weights(trackers, horizon_days=horizon_days)
+
+    selected_trackers = {
+        name: tracker
+        for name, tracker in trackers.items()
+        if name in selected_weights
+    }
+
     return {
         "unit": "fractional_return_per_observation",
         "cost_basis": "net_after_cost",
-        "weight_convention": "max(0, mean - kappa*std), normalised over ACTIVE",
+        "horizon_days": (
+            horizon_days
+            if horizon_days is not None
+            else next(
+                iter({t.horizon_days for t in selected_trackers.values()}),
+                None,
+            )
+        ),
+        "weight_convention": "max(0, mean - kappa*std), normalized over ACTIVE",
         "models": {
-            name: {**t.snapshot(), "weight": w[name]}
-            for name, t in trackers.items()
+            name: {
+                **tracker.snapshot(),
+                "weight": selected_weights[name],
+            }
+            for name, tracker in selected_trackers.items()
         },
-        "eligible_count": sum(1 for t in trackers.values() if t.eligible),
-        "total_weight": sum(w.values()),
+        "eligible_count": sum(
+            1 for tracker in selected_trackers.values() if tracker.eligible
+        ),
+        "total_weight": sum(selected_weights.values()),
     }

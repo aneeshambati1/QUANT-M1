@@ -15,6 +15,10 @@ This module does not estimate covariance.
 
 UNITS: expected_returns and cov are per the SAME horizon. weights are fractions
 of NAV, cash_frac = 1 - invested_frac. No dollar amounts here.
+
+FAIL-CLOSED: current_weights must be feasible (long-only, gross<=1). If the
+solver returns non-finite or constraint-violating output, the result falls back
+to the feasible current weights (or cash) and is marked solver_ok=False.
 """
 from __future__ import annotations
 
@@ -70,10 +74,14 @@ def solve_allocation(expected_returns, cov, risk_aversion: float = 1.0,
         raise AllocationError(f"cov must be ({n},{n}), got {C.shape}")
     if not np.all(np.isfinite(mu)) or not np.all(np.isfinite(C)):
         raise AllocationError("inputs must be finite")
-    if risk_aversion <= 0:
-        raise AllocationError("risk_aversion must be > 0")
-    if band_frac < 0:
-        raise AllocationError("band_frac must be >= 0")
+    if not np.isfinite(risk_aversion) or risk_aversion <= 0:
+        raise AllocationError("risk_aversion must be finite and > 0")
+    if not np.isfinite(band_frac) or band_frac < 0:
+        raise AllocationError("band_frac must be finite and >= 0")
+    if not np.isfinite(tol) or tol <= 0:
+        raise AllocationError("tol must be finite and > 0")
+    if not isinstance(max_iter, int) or max_iter < 1:
+        raise AllocationError("max_iter must be a positive integer")
 
     C = 0.5 * (C + C.T)
     min_eig = float(np.linalg.eigvalsh(C).min())
@@ -85,6 +93,13 @@ def solve_allocation(expected_returns, cov, risk_aversion: float = 1.0,
         w0 = np.asarray(current_weights, dtype=float)
         if w0.shape != (n,):
             raise AllocationError(f"current_weights must be ({n},), got {w0.shape}")
+        if not np.all(np.isfinite(w0)):
+            raise AllocationError("current_weights must be finite")
+        if np.any(w0 < -1e-9) or float(w0.sum()) > 1.0 + 1e-9:
+            raise AllocationError("current_weights must be long-only and gross<=1")
+        w0 = np.clip(w0, 0.0, None)
+        if float(w0.sum()) > 1.0:
+            w0 = w0 / float(w0.sum())
 
     def obj(w):
         return float(-mu @ w + 0.5 * risk_aversion * (w @ C @ w))
@@ -100,14 +115,20 @@ def solve_allocation(expected_returns, cov, risk_aversion: float = 1.0,
 
     res = minimize(obj, x0, jac=grad, method="SLSQP", bounds=bounds,
                    constraints=cons, options={"maxiter": max_iter, "ftol": tol})
-    w = np.clip(res.x, 0.0, None)
-    if w.sum() > 1.0:
-        w = w / w.sum()
+    raw = np.asarray(res.x, dtype=float)
+    solver_ok = (bool(res.success) and np.all(np.isfinite(raw))
+                 and np.all(raw >= -1e-6) and float(raw.sum()) <= 1.0 + 1e-6)
+    if solver_ok:
+        w = np.clip(raw, 0.0, None)
+        if w.sum() > 1.0:
+            w = w / w.sum()
+    else:
+        w = w0.copy() if w0 is not None else np.zeros(n)
 
     band_applied = False
-    if w0 is not None and band_frac > 0.0:
+    if w0 is not None and band_frac > 0.0 and solver_ok:
         if float(np.max(np.abs(w - w0))) < band_frac:
-            w = np.clip(w0, 0.0, None)
+            w = w0.copy()
             band_applied = True
 
     ref = w0 if w0 is not None else np.zeros(n)
@@ -120,5 +141,5 @@ def solve_allocation(expected_returns, cov, risk_aversion: float = 1.0,
         variance=float(w @ C @ w),
         turnover=float(np.abs(w - ref).sum()),
         band_applied=band_applied,
-        solver_ok=bool(res.success),
+        solver_ok=solver_ok,
     )

@@ -9,6 +9,13 @@ G0 changes over M1.2:
   - Mandate version/digest can be propagated explicitly into VerifiedState.
   - Composite atomic persistence helpers are provided for Gateway use.
 
+M1.7 hardening:
+  - WorkingOrder enforces integer types (rejects bool/float/NaN economics).
+  - Mandate bps fields reject bool.
+  - EventLog.restore enforces strictly increasing integer seq.
+  - Ledger.control_digest() binds replay-protection control state for the
+    signed composite (B2).
+
 IMPORTANT:
   receivables is the SINGLE source of truth for unsettled money.
   Do not add a parallel cash_unsettled field.
@@ -114,7 +121,7 @@ class Mandate:
             "cvar_bps", "cvar_q_bps", "drawdown_trigger_bps", "participation_bps",
         ):
             v = getattr(self, name)
-            if not isinstance(v, int) or v < 0 or v > BPS:
+            if isinstance(v, bool) or not isinstance(v, int) or v < 0 or v > BPS:
                 raise ConfigAuthorityError(f"{name} must be int in [0, {BPS}]")
         if self.cvar_q_bps < 1:
             raise ConfigAuthorityError("cvar_q_bps must be >= 1")
@@ -327,7 +334,14 @@ class EventLog:
         data = self.store.load()
         self.chain = data if data else []
         prev = "0" * 64
+        prev_seq = None
         for rec in self.chain:
+            seq = rec.get("seq")
+            if isinstance(seq, bool) or not isinstance(seq, int):
+                raise ValueError("event log seq must be an integer")
+            if prev_seq is not None and seq <= prev_seq:
+                raise ValueError("event log seq must be strictly increasing")
+            prev_seq = seq
             supplied = rec.get("hash")
             body = {k: v for k, v in rec.items() if k != "hash"}
             expected = hashlib.sha256((prev + canonical(body)).encode()).hexdigest()
@@ -377,6 +391,11 @@ class WorkingOrder:
     def __post_init__(self) -> None:
         if self.side not in {"BUY", "SELL"}:
             raise ValueError(f"invalid side: {self.side}")
+        for name in ("qty", "cum_filled", "price", "cost_bps",
+                     "filled_notional", "filled_cost", "trade_date"):
+            v = getattr(self, name)
+            if isinstance(v, bool) or not isinstance(v, int):
+                raise ValueError(f"{name} must be an integer")
         if self.cum_filled < 0 or self.qty < 0 or self.cum_filled > self.qty:
             raise ValueError("require 0 <= cum_filled <= qty")
         if self.price < 0 or self.cost_bps < 0:
@@ -499,6 +518,21 @@ class Ledger:
             "reserved": self.reserved,
             "last_settled_session": self.last_settled_session,
         }
+
+    def control_digest(self) -> str:
+        """Digest of ledger CONTROL state (nonces, fills, reservations, session).
+
+        Bound into the signed composite so tampering with replay-protection
+        state is detected even though it is outside VerifiedState.digest() (B2).
+        """
+        return sha({
+            "spent_nonces": sorted(self.spent_nonces),
+            "applied_exec_ids": sorted(self.applied_exec_ids),
+            "applied_exec_hashes": self.applied_exec_hashes,
+            "submit_seq": list(self.submit_seq),
+            "reserved": self.reserved,
+            "last_settled_session": self.last_settled_session,
+        })
 
     def persist(self) -> None:
         self.store.save(self.to_dict())

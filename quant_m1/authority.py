@@ -1,31 +1,36 @@
-"""M1.6 authorization kernel and execution gateway.
+"""M1.7 authorization kernel and execution gateway.
 
-Changes over M1.5:
-  - RED-TEAM B15: the divergence latch is recovered from the audit chain, not
-    from the composite alone. Deleting composite_state.json no longer clears
-    a recorded latch.
-  - RED-TEAM B15: a missing composite alongside a non-empty audit chain is an
-    integrity fault, not a clean first start.
-  - RED-TEAM B15: composite/audit latch disagreement is recorded as a fault.
-    The audit chain is authoritative.
-  - RED-TEAM B15: clear_divergence() requires an authenticated operator
-    command (HMAC over reason+nonce+seq), a current sequence number, and an
-    unused nonce. Replay is rejected against the audit chain.
+Changes over M1.6 (this repair pass):
+  - P0 FIX: operator clearance uses an INDEPENDENT one-time key hash chain
+    (OperatorConsole). The Gateway stores only sha256(current_operator_secret)
+    and can no longer mint its own clear. The reveal is consumed and rotated;
+    revealed secrets are never logged.
+  - B1 FIX: Token binds ops_digest; submit rejects TOKEN_CONFIG_STALE on any
+    operational-config change.
+  - B2 FIX: composite binds Ledger.control_digest() (nonces, fills, reserved,
+    session); tampering with replay-protection state is detected on restore.
+  - B3 FIX: composite is HMAC-signed with the gateway key; an unsigned or
+    altered composite latches COMPOSITE_SIGNATURE_INVALID.
+  - FILL integrity: an event claiming cum_qty beyond the authoritative venue
+    snapshot latches FILL_AHEAD_OF_VENUE.
+  - Reconciliation: a venue order absent from the ledger latches
+    UNEXPECTED_VENUE_ORDER.
 
-Retained from M1.5:
+Retained from M1.6/M1.5 (unchanged):
+  - B15: divergence latch recovered from the audit chain, not the composite;
+    missing composite with audit history is an integrity fault; composite/audit
+    latch disagreement is a fault; audit chain is authoritative.
   - Q: submit() re-checks NEW_RISK for BUY and mark staleness at transmission.
-  - S: restore_flags() restores and verifies EventLog BEFORE head comparison;
-    audit-head check uses chain membership; mismatch paths do not overwrite
-    the composite.
+  - S: restore_flags() verifies EventLog BEFORE head comparison; audit-head
+    check uses chain membership; mismatch paths do not overwrite the composite.
+  - CRASH_A / CRASH_B, RESERVATION_INTENT_MISMATCH, _replace_order raising
+    UNKNOWN_ORDER, Kernel.authorize persisting before return, LEDGER_ONLY skip,
+    timeout-stays-ambiguous, snapshot-authoritative fills.
 
-PRESERVED VERBATIM: CRASH_A / CRASH_B, RESERVATION_INTENT_MISMATCH,
-_replace_order raising UNKNOWN_ORDER, Kernel.authorize persisting before
-return, LEDGER_ONLY skip, all execution-path methods.
-
-STILL DEFERRED (require Token schema change or key management):
-  - B1: operational-config version not bound into the token.
-  - B2: ledger control state not bound into the state digest.
-  - B3: persisted ledger is unsigned.
+Threat model: the gateway key protects tokens and the composite against parties
+without the key. Full gateway-process compromise is out of scope, but the
+operator hash chain specifically prevents a gateway-key holder from clearing a
+divergence latch, because the Gateway never holds an operator secret.
 """
 from __future__ import annotations
 
@@ -67,6 +72,7 @@ class Token:
     nonce: str
     mandate_version: int
     config_digest: str
+    ops_digest: str
     sig: str
 
     def body(self) -> dict:
@@ -79,10 +85,40 @@ def sign(key: bytes, body: dict) -> str:
     return hmac.new(key, sha(body).encode(), hashlib.sha256).hexdigest()
 
 
-def operator_clear_body(reason: str, nonce: str, seq: int) -> dict:
-    """Canonical body for an operator clear command. Signed by the key holder."""
+def operator_clear_body(reason: str, nonce: str, seq: int, next_hash: str) -> dict:
+    """Canonical body for an operator clear command (one-time key + rotation)."""
     return {"action": OPERATOR_CLEAR_ACTION, "reason": reason,
-            "nonce": nonce, "seq": seq}
+            "nonce": nonce, "seq": seq, "next_hash": next_hash}
+
+
+class OperatorConsole:
+    """Independent operator authority holding the secret the Gateway never has.
+
+    The Gateway stores only sha256(current_operator_secret). A clear reveals the
+    current secret (hash-preimage proof) plus an HMAC over the body keyed by it,
+    and the hash of the NEXT one-time secret. The Gateway verifies, consumes the
+    reveal, and rotates to next_hash. A compromised Gateway holds only a hash and
+    cannot forge a future clear. Revealed secrets are never logged. Rotation is a
+    forward hash chain; each clear consumes one link.
+
+    Key ownership: OperatorConsole alone holds secrets. Persistence contract: the
+    Gateway persists only the current hash (signed composite + audit chain).
+    """
+
+    def __init__(self, secret: bytes | None = None):
+        self._secret = secret if secret is not None else os.urandom(32)
+
+    def current_hash(self) -> str:
+        return hashlib.sha256(self._secret).hexdigest()
+
+    def make_clear(self, reason: str, nonce: str, seq: int) -> dict:
+        nxt = os.urandom(32)
+        nh = hashlib.sha256(nxt).hexdigest()
+        sig = sign(self._secret, operator_clear_body(reason, nonce, seq, nh))
+        cmd = {"reason": reason, "nonce": nonce, "seq": seq,
+               "key_reveal": self._secret.hex(), "next_hash": nh, "sig": sig}
+        self._secret = nxt
+        return cmd
 
 
 @dataclass(frozen=True)
@@ -188,6 +224,7 @@ class Kernel:
                     nonce=nonce,
                     mandate_version=cfg.mandate.version,
                     config_digest=cfg.mandate.digest(),
+                    ops_digest=cfg.ops.digest(),
                     sig="",
                 )
                 tok = Token(**{**asdict(tok0), "sig": sign(self.key, tok0.body())})
@@ -204,7 +241,8 @@ class Gateway:
     def __init__(self, key: bytes, cfg: ConfigAuthority, ledger: Ledger, log: EventLog,
                  venue: MockVenue, clock: Clock, instruments: dict[str, Instrument],
                  scenarios: tuple[dict[str, int], ...], flags: Flags,
-                 watchdog_path: str, lock=None, flags_store: Store | None = None):
+                 watchdog_path: str, lock=None, flags_store: Store | None = None,
+                 operator_hash: str | None = None):
         self.key, self.cfg, self.ledger, self.log = key, cfg, ledger, log
         self.venue, self.clock, self.instruments = venue, clock, instruments
         self.scenarios, self.flags, self.watchdog_path = scenarios, flags, watchdog_path
@@ -215,6 +253,7 @@ class Gateway:
         self.composite_store = Store(os.path.join(base_dir, "composite_state.json"))
         self._divergence_latched = False
         self._restore_fault = None
+        self._operator_hash = operator_hash
 
     # ---- durable composite write: ledger + flags + latch + audit head ----
 
@@ -225,8 +264,11 @@ class Gateway:
             "flags": asdict(self.flags),
             "divergence_latched": self._divergence_latched,
             "ledger_digest": self.ledger.state.digest(),
+            "control_digest": self.ledger.control_digest(),
+            "operator_hash": self._operator_hash,
             "audit_head": self.log.head(),
         }
+        payload["composite_sig"] = sign(self.key, payload)
         self.composite_store.save(payload)
 
     def _latch_silent(self, reason: str) -> None:
@@ -271,6 +313,9 @@ class Gateway:
             return True
 
         audit_latched = self._latch_from_audit()
+        ah = self._operator_hash_from_audit()
+        if ah is not None:
+            self._operator_hash = ah
         has_history = bool(self.log.chain)
 
         d = self.composite_store.load()
@@ -322,6 +367,13 @@ class Gateway:
             self._latch_silent("FLAGS_SCHEMA_UNKNOWN")
             return True
 
+        supplied_sig = d.get("composite_sig")
+        sig_body = {k: v for k, v in d.items() if k != "composite_sig"}
+        if not isinstance(supplied_sig, str) or not hmac.compare_digest(
+                supplied_sig, sign(self.key, sig_body)):
+            self._latch_silent("COMPOSITE_SIGNATURE_INVALID")
+            return True
+
         ledger_data = d.get("ledger")
         if ledger_data is None:
             self._latch_silent("COMPOSITE_LEDGER_MISSING")
@@ -359,6 +411,10 @@ class Gateway:
             self._latch_silent("FLAGS_LEDGER_DIGEST_MISMATCH")
             return True
 
+        if d.get("control_digest") and d["control_digest"] != self.ledger.control_digest():
+            self._latch_silent("FLAGS_CONTROL_DIGEST_MISMATCH")
+            return True
+
         # 3. Audit head: the log may legitimately be AHEAD of the composite
         #    (persist-then-append window). Only a LOST event is a divergence.
         expected = d.get("audit_head")
@@ -375,32 +431,56 @@ class Gateway:
         self.flags.exec = "DIVERGENT"
         self.log.append("DIVERGENCE_LATCHED", {"reason": reason}, self.clock.next())
 
-    def operator_clear_signature(self, reason: str, nonce: str, seq: int) -> str:
-        """Mint an operator clear signature. Requires possession of the key.
+    def _operator_hash_from_audit(self) -> str | None:
+        """Authoritative current operator hash from the audit chain."""
+        cur = None
+        for rec in self.log.chain:
+            if rec.get("kind") == "OPERATOR_REGISTERED":
+                cur = rec.get("payload", {}).get("operator_hash")
+            elif rec.get("kind") == "DIVERGENCE_CLEARED":
+                nh = rec.get("payload", {}).get("next_hash")
+                if nh:
+                    cur = nh
+        return cur
 
-        Provided so an operator console can produce a valid command without
-        reimplementing the canonical body. Holding the Gateway reference alone
-        is NOT sufficient to clear a latch.
-        """
-        return sign(self.key, operator_clear_body(reason, nonce, seq))
+    def register_operator(self, operator_hash: str) -> None:
+        """Register the hash of the independent operator's first one-time key."""
+        with self.lock:
+            if not isinstance(operator_hash, str) or len(operator_hash) != 64:
+                raise Reject("OPERATOR_HASH_INVALID")
+            self._operator_hash = operator_hash
+            self.log.append("OPERATOR_REGISTERED",
+                            {"operator_hash": operator_hash}, self.clock.next())
+            self._persist()
 
     def clear_divergence(self, operator_reason: str, *, nonce: str | None = None,
-                         seq: int | None = None,
-                         operator_sig: str | None = None) -> None:
-        """Clear a latched divergence. Requires an authenticated operator command.
+                         seq: int | None = None, key_reveal: str | None = None,
+                         next_hash: str | None = None, sig: str | None = None) -> None:
+        """Clear a latch with an independent one-time operator command.
 
-        B15: a free-text reason is not authorization. The caller must present
-        an HMAC over {action, reason, nonce, seq} keyed by the gateway key,
-        at the current sequence number, with a nonce not already used in a
-        prior DIVERGENCE_CLEARED event.
+        The Gateway holds only the hash of the current operator secret, so it
+        cannot self-clear. Requires hash-preimage possession, a valid HMAC over
+        {action, reason, nonce, seq, next_hash}, the current seq, an unused nonce,
+        and a valid rotation commitment. The reveal is never logged.
         """
         with self.lock:
             if not operator_reason or not operator_reason.strip():
                 raise Reject("OPERATOR_REASON_REQUIRED")
-            if nonce is None or seq is None or operator_sig is None:
+            if (nonce is None or seq is None or key_reveal is None
+                    or next_hash is None or sig is None):
                 raise Reject("OPERATOR_AUTH_REQUIRED")
-            expected = sign(self.key, operator_clear_body(operator_reason, nonce, seq))
-            if not hmac.compare_digest(operator_sig, expected):
+            if self._operator_hash is None:
+                raise Reject("OPERATOR_NOT_REGISTERED")
+            try:
+                reveal = bytes.fromhex(key_reveal)
+            except (ValueError, TypeError):
+                raise Reject("OPERATOR_BAD_KEY")
+            if hashlib.sha256(reveal).hexdigest() != self._operator_hash:
+                raise Reject("OPERATOR_BAD_KEY")
+            if not isinstance(next_hash, str) or len(next_hash) != 64:
+                raise Reject("OPERATOR_BAD_NEXT_HASH")
+            body = operator_clear_body(operator_reason, nonce, seq, next_hash)
+            if not hmac.compare_digest(sig, sign(reveal, body)):
                 raise Reject("OPERATOR_BAD_SIGNATURE")
             if seq != self.clock.seq:
                 raise Reject("OPERATOR_SEQ_STALE")
@@ -413,9 +493,11 @@ class Gateway:
             self._divergence_latched = False
             self.flags.exec = "OK"
             self._restore_fault = None
+            self._operator_hash = next_hash
             self.log.append("DIVERGENCE_CLEARED",
                             {"reason": operator_reason, "nonce": nonce,
-                             "operator_seq": seq}, self.clock.next())
+                             "operator_seq": seq, "next_hash": next_hash},
+                            self.clock.next())
             self._persist()
 
     def _watchdog(self) -> bool:
@@ -464,6 +546,9 @@ class Gateway:
                 raise Reject("CONFIG_UNATTESTED")
             if (tok.mandate_version != self.cfg.mandate.version or
                     tok.config_digest != self.cfg.mandate.digest()):
+                self._expire(tok)
+                raise Reject("TOKEN_CONFIG_STALE")
+            if tok.ops_digest != self.cfg.ops.digest():
                 self._expire(tok)
                 raise Reject("TOKEN_CONFIG_STALE")
             if (self.ledger.state.mandate_version != self.cfg.mandate.version or
@@ -574,6 +659,10 @@ class Gateway:
                     self.latch_divergence("FILL_WITHOUT_VENUE_ORDER")
                     self._persist()
                     return "FILL_UNCONFIRMED_RESERVED"
+                if ev.cum_qty > vo["cum_qty"]:
+                    self.latch_divergence("FILL_AHEAD_OF_VENUE")
+                    self._persist()
+                    return "FILL_UNCONFIRMED_RESERVED"
                 if vo["cum_qty"] < o.cum_filled or vo["cum_qty"] > o.qty:
                     self.latch_divergence("VENUE_CUM_OUT_OF_RANGE")
                     self._persist()
@@ -622,6 +711,8 @@ class Gateway:
                 self._replace_order(ev.order_id, status="CANCELLED")
 
             elif ev.kind == "CANCEL_REJECT":
+                # Cancel rejected: the order remains live. No state change;
+                # reconciliation below re-affirms the authoritative venue state.
                 pass
 
             elif ev.kind == "REJECT":
@@ -740,6 +831,12 @@ class Gateway:
                     return False
             elif vo["status"] in TERMINAL_VENUE:
                 self._replace_order(o.order_id, status=vo["status"])
+
+        ledger_ids = {o.order_id for o in self.ledger.state.working}
+        for vid in snap["orders"]:
+            if vid not in ledger_ids:
+                self.latch_divergence("UNEXPECTED_VENUE_ORDER")
+                return False
 
         self.flags.exec = "DIVERGENT" if self._divergence_latched else "OK"
         return not self._divergence_latched

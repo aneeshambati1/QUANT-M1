@@ -105,7 +105,7 @@ def run_cycle(
         )
 
     elif not eligible:
-        note = "No model has earned positive authority; cash is a valid position."
+        note = "No model has earned positive authority; cash is a position."
 
     elif allocator is None or forecasts is None:
         note = "Allocator or forecasts unavailable; no allocation."

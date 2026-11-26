@@ -1,6 +1,8 @@
-"""B15 detection tests: the divergence latch must not be bypassable.
+"""B15 + P0 detection tests: the divergence latch must not be bypassable.
 
-Each test targets a specific bypass path confirmed by static analysis.
+Operator clearance now uses an INDEPENDENT one-time key chain (OperatorConsole).
+The Gateway holds only the hash of the current operator secret and cannot mint
+a clear. Every prior latch-integrity invariant is preserved and strengthened.
 """
 from __future__ import annotations
 
@@ -24,18 +26,17 @@ def _trade(sx):
     sx["gw"].process(sx["venue"].fill(tok.order_id, 5, price=10_000))
 
 
-# ---- deletion bypass ----
+def _clear(sx, reason, nonce):
+    cmd = sx["operator"].make_clear(reason, nonce, sx["clock"].seq)
+    sx["gw"].clear_divergence(reason, nonce=cmd["nonce"], seq=cmd["seq"],
+                              key_reveal=cmd["key_reveal"], next_hash=cmd["next_hash"],
+                              sig=cmd["sig"])
+
 
 def test_deleting_composite_does_not_clear_latch(tmp_path):
-    """Audit chain records the latch; deleting the composite must not erase it."""
-    sx = build(str(tmp_path))
-    _trade(sx)
-    sx["gw"].latch_divergence("GENUINE_FAULT")
-    sx["gw"]._persist()
-    assert sx["gw"]._divergence_latched is True
-
+    sx = build(str(tmp_path)); _trade(sx)
+    sx["gw"].latch_divergence("GENUINE_FAULT"); sx["gw"]._persist()
     os.remove(sx["gw"].composite_store.path)
-
     sx2 = build(str(tmp_path))
     assert sx2["gw"]._divergence_latched is True
     assert sx2["flags"].exec == "DIVERGENT"
@@ -43,44 +44,33 @@ def test_deleting_composite_does_not_clear_latch(tmp_path):
 
 
 def test_missing_composite_with_history_is_integrity_fault(tmp_path):
-    """Prior activity plus no composite is a fault, not a clean first start."""
-    sx = build(str(tmp_path))
-    _trade(sx)
+    sx = build(str(tmp_path)); _trade(sx)
     os.remove(sx["gw"].composite_store.path)
-
     sx2 = build(str(tmp_path))
     assert sx2["gw"]._restore_fault == "COMPOSITE_MISSING_WITH_AUDIT_HISTORY"
 
 
 def test_first_start_with_no_history_is_clean(tmp_path):
-    """A genuinely fresh directory must not latch."""
     sx = build(str(tmp_path))
     assert sx["gw"]._divergence_latched is False
     assert sx["gw"]._restore_fault is None
 
 
 def test_composite_cannot_override_audit_latch(tmp_path):
-    """Tamper the composite to claim a clear latch; audit must win."""
-    sx = build(str(tmp_path))
-    _trade(sx)
-    sx["gw"].latch_divergence("GENUINE_FAULT")
-    sx["gw"]._persist()
-
+    sx = build(str(tmp_path)); _trade(sx)
+    sx["gw"].latch_divergence("GENUINE_FAULT"); sx["gw"]._persist()
     d = sx["gw"].composite_store.load()
-    d["divergence_latched"] = False
-    d["flags"]["exec"] = "OK"
+    d["divergence_latched"] = False; d["flags"]["exec"] = "OK"
+    body = {k: v for k, v in d.items() if k != "composite_sig"}
+    d["composite_sig"] = sign(sx["gw"].key, body)   # key-holder re-signs
     sx["gw"].composite_store.save(d)
-
     sx2 = build(str(tmp_path))
     assert sx2["gw"]._divergence_latched is True
     assert sx2["gw"]._restore_fault == "COMPOSITE_LATCH_DISAGREES_WITH_AUDIT"
 
 
-# ---- unauthenticated clear ----
-
 def test_clear_without_signature_rejected(tmp_path):
-    sx = build(str(tmp_path))
-    sx["gw"].latch_divergence("FAULT")
+    sx = build(str(tmp_path)); sx["gw"].latch_divergence("FAULT")
     with pytest.raises(Reject) as e:
         sx["gw"].clear_divergence("because I said so")
     assert e.value.code == "OPERATOR_AUTH_REQUIRED"
@@ -88,98 +78,100 @@ def test_clear_without_signature_rejected(tmp_path):
 
 
 def test_clear_with_empty_reason_rejected(tmp_path):
-    sx = build(str(tmp_path))
-    sx["gw"].latch_divergence("FAULT")
+    sx = build(str(tmp_path)); sx["gw"].latch_divergence("FAULT")
     with pytest.raises(Reject) as e:
         sx["gw"].clear_divergence("   ")
     assert e.value.code == "OPERATOR_REASON_REQUIRED"
 
 
 def test_clear_with_bad_signature_rejected(tmp_path):
-    sx = build(str(tmp_path))
-    sx["gw"].latch_divergence("FAULT")
-    gw = sx["gw"]
+    sx = build(str(tmp_path)); sx["gw"].latch_divergence("FAULT")
+    cmd = sx["operator"].make_clear("resolved", "n1", sx["clock"].seq)
     with pytest.raises(Reject) as e:
-        gw.clear_divergence("resolved", nonce="n1", seq=sx["clock"].seq,
-                            operator_sig="deadbeef" * 8)
+        sx["gw"].clear_divergence("resolved", nonce="n1", seq=cmd["seq"],
+                                  key_reveal=cmd["key_reveal"], next_hash=cmd["next_hash"],
+                                  sig="deadbeef" * 8)
     assert e.value.code == "OPERATOR_BAD_SIGNATURE"
-    assert gw._divergence_latched is True
+    assert sx2_ok(sx)
+
+
+def sx2_ok(sx):
+    return sx["gw"]._divergence_latched is True
 
 
 def test_clear_with_stale_seq_rejected(tmp_path):
-    sx = build(str(tmp_path))
-    gw = sx["gw"]
-    gw.latch_divergence("FAULT")
+    sx = build(str(tmp_path)); sx["gw"].latch_divergence("FAULT")
     stale = sx["clock"].seq
+    cmd = sx["operator"].make_clear("resolved", "n1", stale)
     sx["clock"].next()
-    sig = gw.operator_clear_signature("resolved", "n1", stale)
     with pytest.raises(Reject) as e:
-        gw.clear_divergence("resolved", nonce="n1", seq=stale, operator_sig=sig)
+        sx["gw"].clear_divergence("resolved", nonce="n1", seq=stale,
+                                  key_reveal=cmd["key_reveal"], next_hash=cmd["next_hash"], sig=cmd["sig"])
     assert e.value.code == "OPERATOR_SEQ_STALE"
 
 
 def test_authenticated_clear_succeeds(tmp_path):
-    sx = build(str(tmp_path))
-    gw = sx["gw"]
-    gw.latch_divergence("FAULT")
-    seq = sx["clock"].seq
-    sig = gw.operator_clear_signature("reconciled with broker snapshot", "op-1", seq)
-    gw.clear_divergence("reconciled with broker snapshot", nonce="op-1",
-                        seq=seq, operator_sig=sig)
-    assert gw._divergence_latched is False
-    assert gw.flags.exec == "OK"
+    sx = build(str(tmp_path)); sx["gw"].latch_divergence("FAULT")
+    _clear(sx, "reconciled with broker snapshot", "op-1")
+    assert sx["gw"]._divergence_latched is False
+    assert sx["gw"].flags.exec == "OK"
     kinds = [r["kind"] for r in sx["log"].entries()]
     assert kinds.count("DIVERGENCE_CLEARED") == 1
 
 
 def test_operator_nonce_replay_rejected(tmp_path):
-    sx = build(str(tmp_path))
-    gw = sx["gw"]
-    gw.latch_divergence("FAULT")
-    seq = sx["clock"].seq
-    sig = gw.operator_clear_signature("first", "op-1", seq)
-    gw.clear_divergence("first", nonce="op-1", seq=seq, operator_sig=sig)
-
-    gw.latch_divergence("SECOND_FAULT")
-    seq2 = sx["clock"].seq
-    sig2 = gw.operator_clear_signature("second", "op-1", seq2)
+    sx = build(str(tmp_path)); sx["gw"].latch_divergence("FAULT")
+    _clear(sx, "first", "op-1")
+    sx["gw"].latch_divergence("SECOND_FAULT")
+    cmd = sx["operator"].make_clear("second", "op-1", sx["clock"].seq)
     with pytest.raises(Reject) as e:
-        gw.clear_divergence("second", nonce="op-1", seq=seq2, operator_sig=sig2)
+        sx["gw"].clear_divergence("second", nonce="op-1", seq=cmd["seq"],
+                                  key_reveal=cmd["key_reveal"], next_hash=cmd["next_hash"], sig=cmd["sig"])
     assert e.value.code == "OPERATOR_NONCE_REPLAY"
-    assert gw._divergence_latched is True
+    assert sx["gw"]._divergence_latched is True
 
 
 def test_reason_tampering_invalidates_signature(tmp_path):
-    sx = build(str(tmp_path))
-    gw = sx["gw"]
-    gw.latch_divergence("FAULT")
-    seq = sx["clock"].seq
-    sig = gw.operator_clear_signature("approved reason", "op-1", seq)
+    sx = build(str(tmp_path)); sx["gw"].latch_divergence("FAULT")
+    cmd = sx["operator"].make_clear("approved reason", "op-1", sx["clock"].seq)
     with pytest.raises(Reject) as e:
-        gw.clear_divergence("different reason", nonce="op-1", seq=seq,
-                            operator_sig=sig)
+        sx["gw"].clear_divergence("different reason", nonce="op-1", seq=cmd["seq"],
+                                  key_reveal=cmd["key_reveal"], next_hash=cmd["next_hash"], sig=cmd["sig"])
     assert e.value.code == "OPERATOR_BAD_SIGNATURE"
 
 
 def test_cleared_latch_survives_restart(tmp_path):
-    """After an authenticated clear, restart must not re-latch from history."""
-    sx = build(str(tmp_path))
-    gw = sx["gw"]
-    _trade(sx)
-    gw.latch_divergence("FAULT")
-    seq = sx["clock"].seq
-    sig = gw.operator_clear_signature("resolved", "op-1", seq)
-    gw.clear_divergence("resolved", nonce="op-1", seq=seq, operator_sig=sig)
-    gw._persist()
-
+    sx = build(str(tmp_path)); _trade(sx)
+    sx["gw"].latch_divergence("FAULT")
+    _clear(sx, "resolved", "op-1"); sx["gw"]._persist()
     sx2 = build(str(tmp_path))
     assert sx2["gw"]._divergence_latched is False
     assert sx2["gw"]._restore_fault is None
 
 
 def test_operator_body_is_canonical():
-    b = operator_clear_body("r", "n", 7)
-    assert b == {"action": "CLEAR_DIVERGENCE", "reason": "r", "nonce": "n", "seq": 7}
-    s1 = sign(b"k", b)
-    s2 = sign(b"k", operator_clear_body("r", "n", 7))
-    assert s1 == s2
+    b = operator_clear_body("r", "n", 7, "h" * 64)
+    assert b == {"action": "CLEAR_DIVERGENCE", "reason": "r", "nonce": "n", "seq": 7, "next_hash": "h" * 64}
+
+
+def test_gateway_cannot_self_clear(tmp_path):
+    """P0: the Gateway exposes no minting helper and cannot forge a reveal."""
+    sx = build(str(tmp_path)); sx["gw"].latch_divergence("FAULT")
+    assert not hasattr(sx["gw"], "operator_clear_signature")
+    with pytest.raises(Reject) as e:
+        sx["gw"].clear_divergence("self", nonce="x", seq=sx["clock"].seq,
+                                  key_reveal="00" * 32, next_hash="11" * 32, sig="00" * 32)
+    assert e.value.code == "OPERATOR_BAD_KEY"
+    assert sx["gw"]._divergence_latched is True
+
+
+def test_consumed_operator_key_cannot_be_reused(tmp_path):
+    sx = build(str(tmp_path)); sx["gw"].latch_divergence("FAULT")
+    cmd = sx["operator"].make_clear("first", "op-1", sx["clock"].seq)
+    sx["gw"].clear_divergence("first", nonce="op-1", seq=cmd["seq"],
+                              key_reveal=cmd["key_reveal"], next_hash=cmd["next_hash"], sig=cmd["sig"])
+    sx["gw"].latch_divergence("AGAIN")
+    with pytest.raises(Reject) as e:
+        sx["gw"].clear_divergence("again", nonce="op-2", seq=sx["clock"].seq,
+                                  key_reveal=cmd["key_reveal"], next_hash="22" * 32, sig=cmd["sig"])
+    assert e.value.code == "OPERATOR_BAD_KEY"

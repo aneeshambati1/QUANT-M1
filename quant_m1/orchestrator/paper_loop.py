@@ -40,6 +40,8 @@ import tempfile
 from dataclasses import dataclass, field
 from typing import Callable, Mapping, Optional
 
+import numpy as np
+
 from ..meta.state import MarketState
 from .cycle import run_cycle, apply_realized
 from .execution import generate_intents, dispatch_intents
@@ -138,6 +140,9 @@ def run_paper_step(
     optional pre-registered callback mapping the ensemble contribution to
     per-model contributions; if omitted, trackers are NOT mutated (no
     fabricated attribution). The caller may then apply_realized explicitly.
+    
+    CRITICAL FIX: Ensures 'forecasts' contains valid numpy arrays before 
+    passing to run_cycle/allocator to prevent TypeError.
     """
     ledger = sx["ledger"]
     gw = sx["gw"]
@@ -173,7 +178,43 @@ def run_paper_step(
 
     _advance_session(sx, new_trade_date, new_mark_wall, new_marks)
 
-    rec = run_cycle(market_state, trackers, forecasts=forecasts, allocator=allocator)
+    # --- DATA VALIDATION & EXTRACTION (THE FIX) ---
+    # We must ensure the allocator receives numeric arrays, not objects/dicts.
+    try:
+        mu_raw = forecasts.get("expected_returns")
+        cov_raw = forecasts.get("cov")
+        
+        if mu_raw is None or cov_raw is None:
+             raise KeyError("Missing 'expected_returns' or 'cov' in forecasts.")
+             
+        # Force conversion to float64 numpy arrays
+        mu_array = np.asarray(mu_raw, dtype=np.float64)
+        cov_array = np.asarray(cov_raw, dtype=np.float64)
+        
+        # Basic shape sanity check against number of assets in marks
+        n_assets = len(new_marks)
+        if mu_array.shape != (n_assets,) or cov_array.shape != (n_assets, n_assets):
+            raise ValueError(f"Dimension mismatch: mu{mu_array.shape}, cov{cov_array.shape}, expected ({n_assets},)")
+
+        # Update the forecasts dict with cleaned arrays for downstream use
+        # Note: We create a shallow copy to avoid mutating original input unexpectedly
+        clean_forecasts = dict(forecasts)
+        clean_forecasts["expected_returns"] = mu_array
+        clean_forecasts["cov"] = cov_array
+        
+    except Exception as e:
+        # Fail Closed: If data is bad, do not trade. Return blocked report.
+        return PaperStepReport(
+            trade_date=new_trade_date, action="error_data_validation",
+            rule_id="R2_INVALID_FORECAST_DATA", permits_new_risk=False,
+            intents_generated=0, intents_submitted=0, intents_rejected=0,
+            filled_orders=0, starting_nav=starting_nav, baseline_after=baseline_after,
+            model_after=starting_nav, ensemble_contribution=0.0, blocked=True,
+            note=f"Data Validation Failed: {str(e)}",
+        )
+
+    # Run the cycle with CLEANED forecasts
+    rec = run_cycle(market_state, trackers, forecasts=clean_forecasts, allocator=allocator)
 
     generated = submitted = rejected = filled = 0
     reasons: list = []

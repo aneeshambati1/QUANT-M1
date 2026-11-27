@@ -94,30 +94,51 @@ The guarantee is fail-closed behaviour + bounded authority + tested invariants,
 not invulnerability. ~10% annualized net is a research objective, not a promise.
 The paper loop is a single-step component, not yet a complete autonomous system.
 
-## F. Phase 2 verification (HEAD 274b8ad6b475a9a221db968d36e86cf1964beebb, 2026-11-27)
+## F. Phase 2 verification (HEAD acd7fa49ca5c602e3035587068785e92b839d9f9, 2026-11-27)
 
-Full-suite Colab run at b23f8fe (2026-11-27): 558 passed / 0 failed. Fast subset at
-274b8ad (tests/test_phase2.py + tests/test_runner_integration.py): 24 passed.
+Executed at this HEAD (owner Colab run, clean clone): full suite **565 passed / 0
+failed**; `scripts/run_null_suite_v4.py --reps 5000` **ALL PASS**. Earlier counts
+(414, 558) belong to earlier commits and are superseded.
 
 | ID | Item | Status | Evidence |
 |----|------|--------|----------|
-| P2-01 | Runner baselines KeyError 'spy_buy_hold_gross' | RESOLVED | generic benchmark_* + SPY-conditional spy_* keys; 8/8 integration tests |
-| P2-02 | no_authority vs no_trades conflated | RESOLVED | no_authority from tracker eligibility; no_trades from intent count; separated |
-| P2-03 | Promotion ledger program/lifetime budgets, config freeze, terminal closure, single-writer lock | VERIFIED | 16 phase2 tests pass; thread-lock + thread-local depth + flock; CONFIG record; TERMINAL events |
+| P2-01 | Runner baselines KeyError 'spy_buy_hold_gross' | RESOLVED | generic benchmark_* + SPY-conditional spy_* keys; integration tests pass |
+| P2-02 | no_authority vs no_trades conflated | RESOLVED | no_authority from tracker eligibility; no_trades from intent count |
+| P2-03 | Ledger program/lifetime budgets, config freeze, terminal closure, single-writer lock | VERIFIED | thread-lock + thread-local depth + flock; CONFIG record; TERMINAL events; estimator-ID binding |
 | P2-04 | Probe journal separation, immutable families, operational guards, blocked-shadow rejection | VERIFIED | phase2 tests pass; no live authority wiring |
 | P2-05 | SE weights certificate-gated, fail-closed without ledger | VERIFIED | se_weights requires PromotionLedger.is_promoted; excludes terminal |
-| P2-06 | Null suite whole-program + per-cell + frozen reps/seeds | APPLIED | Batch 1 replacement committed; per-cell check added; undeclared LIFETIME_BOUND=0.10 removed |
-| P2-07 | CI null-suite gate | APPLIED | .github/workflows/phase2_null_suite.yml (5000 reps, hashed report artifact) |
-| P2-08 | Null suite calibration FAILS | OPEN — PROTOCOL | 5000 reps: program24_ar0.5 = 0.0738 > 0.07; lifetime48_iid = 0.0974 > 0.07 |
-| P2-09 | Positive-control power | OPEN — PROTOCOL | 0.0444 at z_cell=2.865; no declared numeric floor |
-| P2-10 | Protocol amendment | PROPOSED, NOT APPROVED | evidence/phase2_probe_protocol_v3_amendment_PROPOSED.md |
+| P2-06 | Null suite whole-program + per-cell + frozen reps/seeds | APPLIED | v3 suite retained as estimator library + historical runner |
+| P2-07 | CI null-suite gate | APPLIED | .github/workflows/phase2_null_suite.yml runs the v4 suite at 5000 reps; hashed report artifact |
+| P2-08 | v3 24/48 calibration failure (lifetime bound undefined; AR(1) 0.5 inflation) | SUPERSEDED BY v4 | v3 protocol retained untouched as historical evidence |
+| P2-09 | Positive-control power | DISCLOSED, WEAK | 0.1498 at z_cell=2.1280; INFORMATIONAL by owner decision, not claimed adequate |
+| P2-10 | Protocol amendment v3 (L/A/P options) | SUPERSEDED | owner selected the v4 3/6 redesign instead |
+| P2-11 | v4 3/6 design implemented and calibrated | APPLIED | ledger defaults g_max=3 / g_lifetime=6; test critical value 2.128; protocol v4 frozen candidate |
+| P2-12 | data_audit fail-closed revision | APPLIED | reproducibility gate, invalid-price/duplicate-date checks, contiguous episodes, session-based gaps, evidence-gated provenance |
+| P2-13 | Phase 2 activation | NOT GRANTED | requires explicit owner approval; SE path OFF; runner reports NO AUTHORITY / NO TRADES |
+| O-12 | Dependency pinning | ADDRESSED (this batch) | quant_m1/requirements.txt now bounded above per major version; prevents silent drift such as the pandas fill_method removal. Exact lockfile still an owner choice |
+| O-13 | Single canonical null-suite entry point | OPEN (cosmetic) | v4 suite imports the verified estimator from run_null_suite.py; running the old file still reports the v3 block |
 
-Root causes of P2-08/P2-09 are protocol inconsistencies, NOT code bugs:
-(1) per-cell Bonferroni-24 across 48 lifetime cells yields theoretical any-false
-rate 1-(1-0.05/24)^48 = 0.0953, incompatible with a 0.07 acceptance bound; the
-protocol declares a lifetime budget (0.10) but no lifetime acceptance bound.
-(2) Bartlett HAC L=21 under-corrects the EWMA-mean variance at AR(1) rho=0.5
-(~2.96x IID inflation), pushing program-wise false promotion above 0.07.
-No frozen parameter has been changed and no threshold tuned to force a pass.
-Phase 2 remains DISABLED pending owner selection of amendment options
-(L1/L2/L3, A1/A2/A3, P1/P2) or a v4 redesign, re-freeze, and a passing 5000-rep suite.
+### v4 3/6 calibration (5000 reps, fixed seeds, prewhitened-AR(1) HAC)
+
+| Check | Rate | Bound | Result |
+|-------|------|-------|--------|
+| program3 IID | 0.0604 | 0.07 | PASS |
+| program3 AR(1) 0.3 | 0.0586 | 0.07 | PASS |
+| program3 AR(1) 0.5 | 0.0552 | 0.07 | PASS |
+| per-cell zero-edge | 0.0178 | 0.026667 | PASS |
+| lifetime6 IID | 0.1016 | 0.12 | PASS |
+| weak-negative | 0.0340 | 0.07 | PASS |
+| cost-domination | 0.0078 | 0.07 | PASS |
+| retirement by 141 | 0.9994 | >= 0.95 | PASS |
+| positive-control power | 0.1498 | informational | DISCLOSED WEAK |
+
+Design rationale: alpha_cell = alpha_lifetime / G_lifetime = 0.10/6 = 0.016667
+(z = 2.1280). Program FWER <= 3*alpha_cell ~ 0.049; lifetime FWER <= 6*alpha_cell
+= 0.10 by construction. The 0.12 lifetime ACCEPTANCE limit adds a 2-point Monte
+Carlo tolerance and does NOT raise the nominal 0.10 budget. No threshold was
+tuned after observing results; the roster reduction was the owner's design
+choice, pre-registered before the confirming 5000-rep run.
+
+Honest limit: power ~0.15 means most genuine modest edges are missed. Passing
+calibration establishes error control, NOT trading edge. The panel remains
+non-PIT and the 13-trial market result remains INCONCLUSIVE.

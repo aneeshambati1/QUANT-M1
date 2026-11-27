@@ -176,7 +176,7 @@ def test_se_weights_all_zero_and_caps():
 
 def test_ledger_one_test_and_lifetime_closure(tmp_path):
     ledger = PromotionLedger(str(tmp_path / "ledger.json"))
-    assert ledger.z_cell == pytest.approx(2.865, abs=0.01)
+    assert ledger.z_cell == pytest.approx(2.128, abs=0.01)
     ledger.register("m1", 1, "famA")
 
     tracker = ContributionTracker()
@@ -230,11 +230,11 @@ def test_ledger_program_and_lifetime_budgets(tmp_path):
 
 def test_ledger_config_frozen_on_restore(tmp_path):
     path = str(tmp_path / "ledger.json")
-    PromotionLedger(path, g_max=24)
+    PromotionLedger(path, g_max=3, g_lifetime=6)
     with pytest.raises(ValueError):
-        PromotionLedger(path, g_max=12)
+        PromotionLedger(path, g_max=2, g_lifetime=6)
     with pytest.raises(ValueError):
-        PromotionLedger(path, alpha_global=0.10)
+        PromotionLedger(path, g_max=3, g_lifetime=6, alpha_global=0.10)
 
 
 def test_ledger_retirement_closes_family(tmp_path):

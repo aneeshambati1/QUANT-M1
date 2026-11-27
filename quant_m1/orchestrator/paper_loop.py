@@ -1,10 +1,18 @@
 """Single-step paper-trading orchestration with a shadow-baseline contribution.
 
-FIX (2026-11-27): 
+FIX (2026-11-27):
 - Removed unsafe allocator wrapper that broke the run_cycle API.
-- Removed strict forecast pre-validation that blocked valid empty forecasts 
+- Removed strict forecast pre-validation that blocked valid empty forecasts
   and model_signals inputs. Delegation to run_cycle is now correct.
 - Preserves fail-closed behavior for divergence latches and invalid marks.
+
+PHASE 2 FIX (_shadow_system):
+- The shadow is now built with the REAL universe (instruments, marks, allowlist,
+  product_classes) at construction, and the REAL cfg object is installed on
+  sx["cfg"], kernel.cfg and gw.cfg. ledger.propagate_config binds the shadow
+  ledger to the real mandate version/digest, so CONFIG_STATE_MISMATCH cannot
+  occur. Instruments/scenarios are installed on every holder. The shadow owns
+  its ledger/gateway/venue/workdir; the real system is never mutated.
 """
 from __future__ import annotations
 
@@ -18,7 +26,6 @@ from .cycle import run_cycle, apply_realized
 from .execution import generate_intents, dispatch_intents
 
 _ACCEPTED_FILL = frozenset({"APPLIED", "SNAPSHOT_RECONCILED"})
-
 
 @dataclass
 class PaperStepReport:
@@ -54,10 +61,8 @@ class PaperStepReport:
             "rejection_reasons": list(self.rejection_reasons),
         }
 
-
 def _cash_equivalent(ledger) -> int:
     return ledger.state.cash_settled + ledger.state.receivable_total()
-
 
 def _advance_session(sx, new_trade_date: int, new_mark_wall: int,
                      new_marks: Mapping[str, int]) -> None:
@@ -84,7 +89,6 @@ def _advance_session(sx, new_trade_date: int, new_mark_wall: int,
                       {"trade_date": new_trade_date, "mark_wall": new_mark_wall},
                       clock.next())
         gw._persist()
-
 
 def run_paper_step(
     sx: Mapping,
@@ -133,9 +137,6 @@ def run_paper_step(
 
     _advance_session(sx, new_trade_date, new_mark_wall, new_marks)
 
-    # === CORRECT DELEGATION: No pre-validation that blocks valid empty forecasts ===
-    # run_cycle handles missing keys, model_signals, and returns None for allocation
-    # if the forecast is invalid or empty. This satisfies test_no_allocation_means_no_orders.
     rec = run_cycle(market_state, trackers, forecasts=forecasts, allocator=allocator)
 
     generated = submitted = rejected = filled = 0
@@ -200,10 +201,8 @@ def run_paper_step(
         note=note, rejection_reasons=reasons,
     )
 
-
 # ---------------------------------------------------------------------------
 # Multi-session driver + per-model leave-one-out attribution (O-07 / O-09).
-# (Unchanged from original, preserved for completeness)
 # ---------------------------------------------------------------------------
 
 @dataclass
@@ -215,13 +214,37 @@ class PaperSessionReport:
         return {"step": self.step.as_dict(), "contributions": dict(self.contributions), "attributed": list(self.attributed)}
 
 def _shadow_system(real_sx, start: Mapping, tmpdir: str):
+    """Isolated counterfactual system bound to the REAL mandate/universe.
+
+    Phase 2 repair: build with the real instruments/marks/allowlist/product
+    classes; share the real cfg object read-only on every holder; bind the
+    shadow ledger to the real mandate version/digest via propagate_config.
+    The shadow owns its ledger/gateway/venue/workdir; real_sx is never mutated.
+    """
     from ..system import build as _build
-    sx = _build(tmpdir, cash=start["cash_settled"], positions=start["positions"],
-                marks=start["marks"], trade_date=start["trade_date"], mark_wall=start["mark_wall"])
+    real_cfg = real_sx["cfg"]
+    sx = _build(
+        tmpdir,
+        cash=start["cash_settled"],
+        positions=dict(start["positions"]),
+        marks=dict(start["marks"]),
+        trade_date=start["trade_date"],
+        mark_wall=start["mark_wall"],
+        instruments=real_sx["instruments"],
+        scenarios=real_sx["scenarios"],
+        allowlist=real_cfg.mandate.allowlist,
+        product_classes=real_cfg.mandate.product_classes,
+    )
+    # Share the real config/universe/scenarios read-only on ALL holders.
+    sx["cfg"] = real_cfg
+    sx["instruments"] = real_sx["instruments"]
+    sx["scenarios"] = real_sx["scenarios"]
     for comp in ("kernel", "gw"):
-        sx[comp].cfg = real_sx["cfg"]
+        sx[comp].cfg = real_cfg
         sx[comp].instruments = real_sx["instruments"]
         sx[comp].scenarios = real_sx["scenarios"]
+    # Bind the shadow ledger to the real mandate so authorize() cannot mismatch.
+    sx["ledger"].propagate_config(real_cfg.mandate.version, real_cfg.mandate.digest())
     sx["ledger"].state.receivables = tuple(start["receivables"])
     sx["ledger"].state.peak_nav = start["peak_nav"]
     return sx

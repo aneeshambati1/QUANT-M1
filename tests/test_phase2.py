@@ -97,8 +97,13 @@ def test_ledger_one_test_and_lifetime_closure(tmp_path):
         led.evaluate("m1", 1, t)          # no re-test
     with pytest.raises(ValueError):
         led.register("m1_dup", 1, "famA")  # family closed for lifetime
+    # The 399-observation requirement must be tested with a FRESH tracker at
+    # zero observations. Reusing `t` (already at exactly 399) is a valid
+    # evaluation for a new open cell and must NOT raise.
+    led.register("m2", 1, "famB")
+    fresh = ContributionTracker()  # n = 0
     with pytest.raises(ValueError):
-        led.register("m2", 1, "famB") or led.evaluate("m2", 1, t)  # n check path
+        led.evaluate("m2", 1, fresh)  # EVALUATION_REQUIRES_EXACTLY_399_OBS
     led2 = PromotionLedger(str(tmp_path / "ledger.json"))
     assert "famA" in led2.closed_families  # persisted
 
@@ -107,3 +112,58 @@ def test_probe_gate_is_research_only():
     g = _ProbeGate(1)
     assert g.eligible and g.raw_weight() == 1.0
     assert g.snapshot()["probe_gate"] is True
+
+
+def test_ledger_program_and_lifetime_budgets(tmp_path):
+    path = str(tmp_path / "led.json")
+    led = PromotionLedger(path, g_max=2, g_lifetime=4, alpha_global=0.05,
+                          alpha_lifetime=0.10)
+    led.register("a", 1, "fa")
+    led.register("b", 1, "fb")
+    with pytest.raises(ValueError):
+        led.register("c", 1, "fc")  # program roster (2) exhausted
+    led.new_program("program_2")
+    led.register("c", 1, "fc")      # new program roster, lifetime still bounded
+    led.register("d", 1, "fd")
+    with pytest.raises(ValueError):
+        led.new_program("program_3")  # lifetime cells (4) exhausted
+
+
+def test_ledger_config_frozen_on_restore(tmp_path):
+    path = str(tmp_path / "led.json")
+    PromotionLedger(path, g_max=24)
+    with pytest.raises(ValueError):
+        PromotionLedger(path, g_max=12)  # CONFIG_MISMATCH
+    with pytest.raises(ValueError):
+        PromotionLedger(path, alpha_global=0.10)
+
+
+def test_ledger_retirement_closes_family(tmp_path):
+    path = str(tmp_path / "led.json")
+    led = PromotionLedger(path)
+    led.register("r1", 1, "famR")
+    t = ContributionTracker()
+    for _ in range(120):
+        t.update(-0.01)  # strong negative -> tracker retires under unchanged rule
+    assert t.status.value == "retired"
+    led.record_terminal("r1", 1, "RETIRED")
+    with pytest.raises(ValueError):
+        led.register("r2", 1, "famR")  # family closed without a 399 certificate
+    led2 = PromotionLedger(path)
+    assert "famR" in led2.closed_families
+
+
+def test_ledger_certificate_gates_se_weights(tmp_path):
+    # 120 observations alone must NOT grant SE authority anywhere.
+    from quant_m1.meta.contribution import se_raw_weights
+    t = ContributionTracker()
+    rng = np.random.default_rng(3)
+    for _ in range(120):
+        t.update(float(rng.normal(0.01, 0.001)))
+    # se_stats may be computable at 120, but the LEDGER must refuse evaluation
+    # before 399 and no certificate exists -> no promotion.
+    led = PromotionLedger(str(tmp_path / "led.json"))
+    led.register("m", 1, "famM")
+    with pytest.raises(ValueError):
+        led.evaluate("m", 1, t)  # requires exactly 399
+    assert led.is_promoted("m", 1) is False

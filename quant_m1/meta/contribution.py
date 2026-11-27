@@ -4,6 +4,14 @@ Weights are earned from paired incremental contribution, not raw model PnL.
 Each tracker represents ONE model at ONE holding horizon.
 
 Do not mix daily, weekly, or monthly observations in the same tracker.
+
+PHASE 2 (additive, opt-in): bounded observation history + standard-error
+statistics (renormalized finite-sample EWMA mean, Bartlett-tapered weighted
+covariance variance, n_eff_corr, se_lcb) and SE live-weight helpers. The
+ORIGINAL lcb / status / kappa / weights() path is UNCHANGED. Nothing here is
+used by the live path until the Phase 2 flag is enabled and the null suite
+has passed. Promotion certificates are issued once by the promotion ledger,
+never by repeated tracker status checks.
 """
 from __future__ import annotations
 
@@ -12,13 +20,11 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import Dict, Mapping, Optional
 
-
 class ModelStatus(Enum):
     PROBATION = "probation"
     ACTIVE = "active"
     DEMOTED = "demoted"
     RETIRED = "retired"
-
 
 def marginal_contribution(
     with_model: float,
@@ -35,12 +41,10 @@ def marginal_contribution(
         raise ValueError("cost_frac must be >= 0")
     return (with_model - without_model) - cost_frac
 
-
 def _ewma_lambda(half_life_obs: float) -> float:
     if not math.isfinite(half_life_obs) or half_life_obs <= 0:
         raise ValueError("half_life_obs must be positive and finite")
     return 1.0 - math.pow(2.0, -1.0 / half_life_obs)
-
 
 @dataclass
 class ContributionTracker:
@@ -57,12 +61,17 @@ class ContributionTracker:
     # Fixed return horizon represented by each observation.
     horizon_days: int = 1
 
+    # Phase 2 SE parameters (additive; original path untouched).
+    se_min_obs: int = 120
+    se_max_obs: int = 399
+
     mean: float = 0.0
     var: float = 0.0
     n: int = 0
     idle: int = 0
     _retired: bool = field(default=False, init=False)
     _lam: float = field(default=0.0, init=False, repr=False)
+    _hist: list = field(default_factory=list, init=False, repr=False)
 
     def __post_init__(self) -> None:
         if (isinstance(self.horizon_days, bool)
@@ -87,6 +96,12 @@ class ContributionTracker:
             raise ValueError("mean must be finite")
         if not math.isfinite(self.var) or self.var < 0:
             raise ValueError("var must be finite and >= 0")
+        if (isinstance(self.se_min_obs, bool) or not isinstance(self.se_min_obs, int)
+                or self.se_min_obs < 2):
+            raise ValueError("se_min_obs must be an integer >= 2")
+        if (isinstance(self.se_max_obs, bool) or not isinstance(self.se_max_obs, int)
+                or self.se_max_obs < self.se_min_obs):
+            raise ValueError("se_max_obs must be an integer >= se_min_obs")
 
         self._lam = _ewma_lambda(self.half_life_obs)
 
@@ -142,13 +157,18 @@ class ContributionTracker:
         self.n += 1
         self.idle = 0
 
+        # Phase 2: bounded history for SE statistics (additive).
+        self._hist.append(float(contribution))
+        if len(self._hist) > self.se_max_obs:
+            del self._hist[: len(self._hist) - self.se_max_obs]
+
         if self.n >= self.retire_min_obs and self.mean < -self.retire_band:
             self._retired = True
 
     def decay_idle(self, steps: int = 1) -> None:
         """Decay authority incrementally after the idle grace period."""
         if isinstance(steps, bool) or not isinstance(steps, int) or steps < 0:
-            raise ValueError("steps must be an integer >= 0")
+            raise ValueError("steps must be nonnegative")
         if self._retired or steps == 0:
             return
 
@@ -192,6 +212,58 @@ class ContributionTracker:
             "kappa": self.kappa,
         }
 
+    # ------------------------------------------------------------------
+    # Phase 2 SE statistics (opt-in; never used by the original path).
+    # ------------------------------------------------------------------
+    def se_stats(self, z: float, lag_cap: int = 21) -> dict:
+        """Renormalized finite-sample EWMA mean + Bartlett-tapered weighted
+        covariance variance of that mean. Fail-closed on invalid variance.
+
+        m_hat = sum(w_i x_i)/sum(w_i), w_i = lam*(1-lam)^(n-1-i)
+        Var(m_hat) = [g0*sum(w^2) + 2*sum_k (1-k/(L+1))*g_k*sum_i w_i w_{i+k}]/W^2
+        n_eff_corr = g0 / Var(m_hat);  se_lcb = m_hat - z*sqrt(Var).
+        """
+        if not math.isfinite(z) or z <= 0:
+            raise ValueError("z must be finite and > 0")
+        if isinstance(lag_cap, bool) or not isinstance(lag_cap, int) or lag_cap < 1:
+            raise ValueError("lag_cap must be an integer >= 1")
+        n = len(self._hist)
+        out = {"valid": False, "n": n, "reason": ""}
+        if n < self.se_min_obs:
+            out["reason"] = "insufficient_observations"
+            return out
+        x = self._hist
+        decay = 1.0 - self._lam
+        w = [self._lam * decay ** (n - 1 - i) for i in range(n)]
+        W = sum(w)
+        mhat = sum(wi * xi for wi, xi in zip(w, x)) / W
+        xbar = sum(x) / n
+        d = [xi - xbar for xi in x]
+        g0 = sum(di * di for di in d) / n
+        if not math.isfinite(g0) or g0 <= 0:
+            out["reason"] = "nonpositive_gamma0"
+            return out
+        L = min(lag_cap, n - 1)
+        acc = g0 * sum(wi * wi for wi in w)
+        for k in range(1, L + 1):
+            gk = sum(d[t] * d[t - k] for t in range(k, n)) / n
+            cross = sum(w[i] * w[i + k] for i in range(n - k))
+            acc += 2.0 * (1.0 - k / (L + 1)) * gk * cross
+        var = acc / (W * W)
+        if not math.isfinite(var) or var <= 0:
+            out["reason"] = "nonpositive_variance"
+            return out
+        se = math.sqrt(var)
+        out.update({
+            "valid": True, "reason": "ok", "mean": mhat, "var_mean": var,
+            "se": se, "n_eff_corr": g0 / var, "se_lcb": mhat - z * se,
+            "gamma0": g0, "lag_cap": L,
+        })
+        return out
+
+    def se_snapshot(self, z: float, lag_cap: int = 21) -> dict:
+        return {**self.snapshot(), "se": self.se_stats(z, lag_cap)}
+
 
 def weights(
     trackers: Mapping[str, ContributionTracker],
@@ -211,8 +283,7 @@ def weights(
             )
         selected_horizon = next(iter(horizons), None)
     else:
-        if (isinstance(horizon_days, bool)
-                or not isinstance(horizon_days, int)
+        if (isinstance(horizon_days, bool) or not isinstance(horizon_days, int)
                 or horizon_days < 1):
             raise ValueError("horizon_days must be an integer >= 1")
         selected_horizon = horizon_days
@@ -224,13 +295,80 @@ def weights(
         or tracker.horizon_days == selected_horizon
     }
 
-    raw = {name: tracker.raw_weight() for name, tracker in selected.items()}
+    raw = {name: tracker.raw_weight() for name in selected.items()} if False else {
+        name: tracker.raw_weight() for name, tracker in selected.items()
+    }
     total = sum(raw.values())
 
     if total <= 0.0:
         return {name: 0.0 for name in selected}
 
     return {name: value / total for name, value in raw.items()}
+
+
+def se_raw_weights(
+    trackers: Mapping[str, ContributionTracker],
+    z: float,
+    lag_cap: int = 21,
+) -> Dict[str, float]:
+    """Phase 2 evidence-based raw weight: max(0, se_lcb). Opt-in only."""
+    raw = {}
+    for name, t in trackers.items():
+        st = t.se_stats(z, lag_cap)
+        raw[name] = max(0.0, st["se_lcb"]) if st["valid"] else 0.0
+    return raw
+
+
+def se_weights(
+    trackers: Mapping[str, ContributionTracker],
+    z: float,
+    lag_cap: int = 21,
+    c_model: float = 0.40,
+    c_family: float = 0.50,
+    families: Optional[Mapping[str, str]] = None,
+) -> Dict[str, float]:
+    """Phase 2 live-weight specification (Amendment C), opt-in only.
+
+    Normalize raw over the given set; deterministic water-filling with
+    per-model and per-family caps (<=10 iterations); remainder -> cash.
+    All-zero raw -> all-zero weights (cash), never equal weights.
+    """
+    if not (0 < c_model <= 1 and 0 < c_family <= 1):
+        raise ValueError("caps must be in (0, 1]")
+    raw = se_raw_weights(trackers, z, lag_cap)
+    total = sum(raw.values())
+    if total <= 0.0:
+        return {name: 0.0 for name in trackers}
+    fam = dict(families) if families else {name: name for name in trackers}
+    w = {k: v / total for k, v in raw.items()}
+    for _ in range(10):
+        changed = False
+        for k in list(w):
+            if w[k] > c_model:
+                w[k] = c_model
+                changed = True
+        fs: Dict[str, float] = {}
+        for k, v in w.items():
+            fs[fam[k]] = fs.get(fam[k], 0.0) + v
+        for f, s in fs.items():
+            if s > c_family:
+                scale = c_family / s
+                for k in w:
+                    if fam[k] == f:
+                        w[k] *= scale
+                changed = True
+        if not changed:
+            break
+        free = 1.0 - sum(w.values())
+        elig = [k for k in w
+                if w[k] < c_model - 1e-12 and fs.get(fam[k], 0.0) < c_family - 1e-12]
+        rsum = sum(raw[k] for k in elig)
+        if free > 1e-12 and rsum > 0:
+            for k in elig:
+                w[k] += free * raw[k] / rsum
+        else:
+            break
+    return w
 
 
 def authority_report(
@@ -265,8 +403,6 @@ def authority_report(
             }
             for name, tracker in selected_trackers.items()
         },
-        "eligible_count": sum(
-            1 for tracker in selected_trackers.values() if tracker.eligible
-        ),
+        "eligible_count": sum(1 for tracker in selected_trackers.values() if tracker.eligible),
         "total_weight": sum(selected_weights.values()),
     }

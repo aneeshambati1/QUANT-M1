@@ -13,7 +13,7 @@ ContributionTracker.se_stats before any simulation is accepted.
 IMPORTANT:
 - This is a proposed estimator amendment, not the currently frozen v3 method.
 - The lifetime acceptance rule is undefined in the frozen v3 protocol.
-- An unresolved protocol check keeps this script nonzero and Phase 2 disabled.
+- An unresolved protocol check keeps the script nonzero and Phase 2 disabled.
 - This script never changes statistical limits to force a pass.
 
 Run:
@@ -154,8 +154,7 @@ def cert_components(x: np.ndarray) -> dict:
     Input shape:
         (number_of_series, N_EVAL)
 
-    The function returns estimator components as well as the final
-    one-sided lower confidence bound, allowing a production-parity check.
+    Returns estimator components and the final lower confidence bound.
     """
     x = np.asarray(x, dtype=np.float64)
 
@@ -168,7 +167,9 @@ def cert_components(x: np.ndarray) -> dict:
         raise ValueError("at least one series is required")
 
     if not np.isfinite(x).all():
-        raise ValueError("null suite input contains nonfinite values")
+        raise ValueError(
+            "null suite input contains nonfinite values"
+        )
 
     n = x.shape[1]
     residual_count = n - 1
@@ -176,7 +177,10 @@ def cert_components(x: np.ndarray) -> dict:
     weights = _normalized_ewma_weights(n)
     mean_hat = x @ weights
 
-    centered = x - x.mean(axis=1, keepdims=True)
+    centered = x - x.mean(
+        axis=1,
+        keepdims=True,
+    )
 
     denominator = np.sum(
         centered[:, :-1] * centered[:, :-1],
@@ -203,7 +207,11 @@ def cert_components(x: np.ndarray) -> dict:
 
     # Invalid phi values are replaced only for safe intermediate arithmetic.
     # They remain invalid in the final certificate decision.
-    phi_safe = np.where(phi_valid, phi_hat, 0.0)
+    phi_safe = np.where(
+        phi_valid,
+        phi_hat,
+        0.0,
+    )
 
     residuals = (
         centered[:, 1:]
@@ -212,7 +220,10 @@ def cert_components(x: np.ndarray) -> dict:
 
     residuals = (
         residuals
-        - residuals.mean(axis=1, keepdims=True)
+        - residuals.mean(
+            axis=1,
+            keepdims=True,
+        )
     )
 
     gamma0 = np.mean(
@@ -222,15 +233,21 @@ def cert_components(x: np.ndarray) -> dict:
 
     # Coefficient on the initial state:
     # c0 = sum_t a[t] * phi**t.
-    powers = np.arange(n, dtype=np.float64)
+    powers = np.arange(
+        n,
+        dtype=np.float64,
+    )
 
     c0 = np.sum(
         weights[None, :]
-        * np.power(phi_safe[:, None], powers[None, :]),
+        * np.power(
+            phi_safe[:, None],
+            powers[None, :],
+        ),
         axis=1,
     )
 
-    # Coefficients on residual innovations:
+    # Coefficients on innovations e[1], ..., e[n-1]:
     # c[j] = a[j+1] + phi*c[j+1].
     residual_weights = np.empty(
         (x.shape[0], residual_count),
@@ -267,7 +284,10 @@ def cert_components(x: np.ndarray) -> dict:
     )
 
     # Bartlett HAC on prewhitened residuals.
-    effective_lag = min(LAG, residual_count - 1)
+    effective_lag = min(
+        LAG,
+        residual_count - 1,
+    )
 
     for k in range(1, effective_lag + 1):
         gamma_k = np.sum(
@@ -306,7 +326,9 @@ def cert_components(x: np.ndarray) -> dict:
         dtype=np.float64,
     )
 
-    standard_error[valid] = np.sqrt(var_mean[valid])
+    standard_error[valid] = np.sqrt(
+        var_mean[valid]
+    )
 
     se_lcb = np.full(
         x.shape[0],
@@ -353,7 +375,18 @@ def cert_stats(x: np.ndarray) -> np.ndarray:
 
 
 def verify_production_mirror() -> dict:
-    """Check that the vectorized simulator matches the production tracker."""
+    """Check production/simulator parity using identical full-length samples.
+
+    Retirement is deliberately delayed only in this parity fixture.
+
+    Without this setting, a random sample can trigger the tracker retirement
+    rule before observation 399. The production tracker then correctly stops
+    recording new observations, while the vectorized statistical mirror
+    continues using all 399 observations. Comparing those two different
+    histories creates a false parity failure.
+
+    This does not change production retirement settings or production logic.
+    """
     rng = np.random.default_rng(9001)
 
     scenarios = (
@@ -379,13 +412,21 @@ def verify_production_mirror() -> dict:
     comparisons = 0
 
     for row in observations:
+        # Important: the parity fixture must retain all 399 observations.
+        # Production trackers keep their normal retirement settings.
         tracker = ContributionTracker(
             se_min_obs=120,
             se_max_obs=N_EVAL,
+            retire_min_obs=N_EVAL + 1,
         )
 
         for value in row:
             tracker.update(float(value))
+
+        if tracker.n != N_EVAL:
+            raise RuntimeError(
+                "PARITY_FIXTURE_DID_NOT_RETAIN_ALL_OBSERVATIONS"
+            )
 
         production = tracker.se_stats(
             Z_CELL,
@@ -396,7 +437,9 @@ def verify_production_mirror() -> dict:
             row.reshape(1, -1)
         )
 
-        simulated_valid = bool(simulated["valid"][0])
+        simulated_valid = bool(
+            simulated["valid"][0]
+        )
 
         if bool(production["valid"]) != simulated_valid:
             raise RuntimeError(
@@ -467,6 +510,7 @@ def verify_production_mirror() -> dict:
         "passed": True,
         "comparisons": comparisons,
         "estimator_id": SE_ESTIMATOR_ID,
+        "retirement_disabled_in_fixture": True,
     }
 
 
@@ -487,23 +531,31 @@ def generate(
         or not isinstance(batch, int)
         or batch < 1
     ):
-        raise ValueError("batch must be a positive integer")
+        raise ValueError(
+            "batch must be a positive integer"
+        )
 
     if (
         isinstance(cells, bool)
         or not isinstance(cells, int)
         or cells < 1
     ):
-        raise ValueError("cells must be a positive integer")
+        raise ValueError(
+            "cells must be a positive integer"
+        )
 
     if not math.isfinite(mu):
         raise ValueError("mu must be finite")
 
     if not math.isfinite(sigma) or sigma <= 0:
-        raise ValueError("sigma must be positive and finite")
+        raise ValueError(
+            "sigma must be positive and finite"
+        )
 
     if not -0.999 <= rho <= 0.999:
-        raise ValueError("rho outside supported range")
+        raise ValueError(
+            "rho outside supported range"
+        )
 
     if rho == 0.0:
         return rng.normal(
@@ -557,7 +609,10 @@ def program_false_promotion_rate(
     done = 0
 
     while done < reps:
-        batch = min(chunk, reps - done)
+        batch = min(
+            chunk,
+            reps - done,
+        )
 
         x = generate(
             rng,
@@ -565,7 +620,10 @@ def program_false_promotion_rate(
             cells,
             mu,
             rho,
-        ).reshape(batch * cells, N_EVAL)
+        ).reshape(
+            batch * cells,
+            N_EVAL,
+        )
 
         promoted = cert_stats(x).reshape(
             batch,
@@ -594,7 +652,10 @@ def per_cell_false_rate(
     total = 0
 
     while total < reps:
-        batch = min(chunk, reps - total)
+        batch = min(
+            chunk,
+            reps - total,
+        )
 
         x = generate(
             rng,
@@ -602,7 +663,10 @@ def per_cell_false_rate(
             1,
             mu,
             rho,
-        ).reshape(batch, N_EVAL)
+        ).reshape(
+            batch,
+            N_EVAL,
+        )
 
         false_cells += int(
             cert_stats(x).sum()
@@ -630,7 +694,10 @@ def retirement_detection(
     total = 0
 
     while total < reps:
-        batch = min(chunk, reps - total)
+        batch = min(
+            chunk,
+            reps - total,
+        )
 
         x = generate(
             rng,
@@ -641,7 +708,10 @@ def retirement_detection(
         )[:, 0, :length]
 
         mean = np.zeros(batch)
-        first_hit = np.full(batch, 10**9)
+        first_hit = np.full(
+            batch,
+            10**9,
+        )
 
         for t in range(length):
             mean = (
@@ -658,7 +728,10 @@ def retirement_detection(
             first_hit[hit] = t + 1
 
         detected += int(
-            (first_hit <= RETIRE_MIN + RETIRE_DELTA).sum()
+            (
+                first_hit
+                <= RETIRE_MIN + RETIRE_DELTA
+            ).sum()
         )
 
         total += batch
@@ -703,12 +776,15 @@ def main() -> int:
     if args.chunk < 1:
         parser.error("--chunk must be >= 1")
 
-    # A statistical result is not accepted unless the production estimator
-    # and the vectorized simulator agree on the same input observations.
+    # A statistical result is not accepted unless production and simulator
+    # agree on identical complete observation histories.
     try:
         parity = verify_production_mirror()
+
     except Exception as exc:
-        print(f"FAIL  production/simulator parity: {exc}")
+        print(
+            f"FAIL  production/simulator parity: {exc}"
+        )
         print("PHASE 2 MUST REMAIN DISABLED")
         return 2
 
@@ -720,7 +796,10 @@ def main() -> int:
         bound: float,
         reps: int,
     ) -> None:
-        upper = wilson_upper(rate, reps)
+        upper = wilson_upper(
+            rate,
+            reps,
+        )
 
         checks.append({
             "check": name,
@@ -837,7 +916,7 @@ def main() -> int:
         args.reps,
     )
 
-    # Strong negative retirement detection.
+    # Strong-negative retirement detection.
     retirement = retirement_detection(
         args.reps,
         SEEDS["retire"],
@@ -943,7 +1022,10 @@ def main() -> int:
     output_dir = os.path.dirname(args.out)
 
     if output_dir:
-        os.makedirs(output_dir, exist_ok=True)
+        os.makedirs(
+            output_dir,
+            exist_ok=True,
+        )
 
     with open(
         args.out,
@@ -959,7 +1041,6 @@ def main() -> int:
 
     for item in checks:
         status = item["status"]
-
         extra = ""
 
         if item.get("informational"):

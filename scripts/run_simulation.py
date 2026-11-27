@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Honest exploratory simulation runner (Phase 1, Batch 2).
+"""Honest exploratory simulation runner (Phase 1 Batch 2 + Phase 2 reporting).
 
 Plumbing-only repair. NO signal, authority-rule, or Risk-Kernel change:
   - Capital default is $100,000 = 10_000_000 cents (the amount the experiment
@@ -22,13 +22,18 @@ Plumbing-only repair. NO signal, authority-rule, or Risk-Kernel change:
     drawdown, cash fraction, net return) against cash / SPY / equal-weight
     baselines. Costs are not yet inside the optimizer objective (Phase 2+).
 
+PHASE 2 REPORTING (this revision):
+  - no_authority and no_trades are DISTINCT states and are reported separately.
+  - The Phase 2 SE path is DISABLED here (se_enabled=False). It may be enabled
+    only after scripts/run_null_suite.py passes and the owner approves.
+
 AUTHORITY / BOOTSTRAP (intentional, do not "fix" by forcing trades):
-  run_paper_step is called WITHOUT an attribution callback. The Phase 2
-  probe/shadow bootstrap protocol is not yet approved, so trackers receive no
-  observations, remain in PROBATION at n=0, and earn no authority. The runner
-  therefore reports NO AUTHORITY / NO TRADES. It must NOT manufacture
-  observations or eligibility. An all-cash run is the correct fail-closed
-  outcome, not a performance result.
+  run_paper_step is called WITHOUT an attribution callback. Trackers receive no
+  observations in this runner, remain in PROBATION at n=0, and earn no
+  authority. The runner therefore reports NO AUTHORITY / NO TRADES. It must
+  NOT manufacture observations or eligibility. An all-cash run is the correct
+  fail-closed outcome, not a performance result. Probe attribution is a
+  separate research path (quant_m1/meta/probe.py), never wired in here.
 
 Placeholders carried from Batch 1 (documented, not measured):
   - ADV = $10M and unit beta for every ETF. With a $20k order-notional cap,
@@ -251,7 +256,10 @@ def run_simulation(panel: pd.DataFrame, *, days: int = 60, cash: int = 10_000_00
         "mean_gross_frac": float(daily["gross_frac"].mean()),
         "authority_blocks": authority_blocks,
         "intents_submitted_total": intents_total,
-        "no_authority": intents_total == 0,
+        # Phase 2 clarification: these are DISTINCT states.
+        "no_authority": authority_blocks == len(daily),
+        "no_trades": intents_total == 0,
+        "se_enabled": False,
         "baselines": baselines,
         "registered_symbols": symbols,
         "mandate_version": cfg.mandate.version,
@@ -287,14 +295,18 @@ def format_report(result: dict) -> str:
     lines.append(f"    {b['benchmark_symbol']} buy&hold (gross/net): {b['spy_buy_hold_gross']:.2%} / {b['spy_buy_hold_net']:.2%}")
     lines.append(f"    Equal-weight (gross/net): {b['equal_weight_gross']:.2%} / {b['equal_weight_net']:.2%}")
     lines.append("-" * 64)
-    if s["no_authority"]:
+    if s["no_authority"] and s["no_trades"]:
         lines.append("  RESULT: NO AUTHORITY / NO TRADES")
         lines.append("  No model earned positive authority. Trackers stayed in PROBATION")
         lines.append(f"  (model '{s['model_id']}': n={s['tracker_snapshot']['n']}, "
                      f"status={s['tracker_snapshot']['status']}).")
-        lines.append("  No attribution callback is wired: the Phase 2 probe/bootstrap")
-        lines.append("  protocol is not approved. This all-cash outcome is the intended")
-        lines.append("  fail-closed behavior. It is NOT evidence of edge or of no edge.")
+        lines.append("  Phase 2 SE path is DISABLED (null suite not yet approved/enabled).")
+        lines.append("  This all-cash outcome is intended fail-closed behavior.")
+        lines.append("  It is NOT evidence of edge or of no edge.")
+    elif s["no_trades"]:
+        lines.append("  RESULT: AUTHORITY PRESENT / NO TRADES")
+        lines.append("  Some model held authority but no orders executed (band, dust")
+        lines.append("  filter, policy, or Risk Kernel veto). Inspect daily notes.")
     else:
         lines.append("  TRADES OCCURRED: verify they came from earned authority, not")
         lines.append("  synthetic eligibility, before interpreting any return.")
@@ -309,6 +321,7 @@ def format_report(result: dict) -> str:
     lines.append("    - +/-0.001 daily ER and 0.8/0.2 rank cuts: original uncalibrated")
     lines.append("      research placeholders, unchanged. kappa/probation unchanged.")
     lines.append("    - UNK:ALL shared issuer bucket and 40% issuer cap preserved.")
+    lines.append("    - Phase 2 SE path DISABLED; run_null_suite.py must pass before enabling.")
     lines.append("    - Panel is back-adjusted, non-PIT. No alpha/profitability claim.")
     lines.append("=" * 64)
     return "\n".join(lines)

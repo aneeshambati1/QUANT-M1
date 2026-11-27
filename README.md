@@ -1,54 +1,59 @@
-# QUANT-M1 — Institutional Paper-Trading Research System
+# QUANT-M1 — Paper-Trading Research System
 
-A safety-first, evidence-driven ETF portfolio research system. **Paper / research
-only — no live capital, no live order routing.**
+**Research and paper trading only. No live capital and no live order routing.**
 
-## What it is
+QUANT-M1 is a safety-first ETF research system. It separates proposal,
+measurement, portfolio construction, risk authority, and paper execution.
 
-An institutional-grade framework that separates three concerns:
+## Core design
 
-1. **Adaptive intelligence proposes** — models generate allocation ideas.
-2. **Independent validation evaluates** — after-cost contribution is measured
-   against counterfactual baselines.
-3. **Risk authority decides** — an independent Risk Kernel holds FINAL VETO over
-   every order. Execution happens only through the authorized paper path.
+- Adaptive models propose; they do not own allocation or execution authority.
+- Contribution is measured against paired counterfactuals, after costs.
+- The independent Risk Kernel has final veto over every order.
+- Cash is a valid portfolio state.
+- Evidence must be reproducible, versioned, and tied to the exact code/config.
+- Synthetic fixtures test mechanics; they are not market validation.
+- No profitability or tradeable-edge claim is established.
 
-## Architecture at a glance
+## Scope
 
-| Layer | Module | Role |
+- US-listed liquid ETFs
+- Long-only, unleveraged
+- USD base currency
+- T+1 settlement logic
+- Paper/research execution only
+- Point-in-time data required for confirmatory research
+
+## Architecture
+
+| Area | Module | Purpose |
 |---|---|---|
-| Safety kernel | `core.py`, `authority.py`, `risk.py` | Integer-money ledger, HMAC authorization, reachable-fill risk veto |
-| Allocation | `allocate/` | Cost-aware long-only optimizer (gross ≤ 1, cash valid) |
-| Meta / learning | `meta/`, `orchestrator/` | Contribution trackers, policy gates, paper loop |
-| Measurement | `research/paired_decision.py` | Paired counterfactual decision ledger (PCDL) |
-| Research governance | `research/governor.py`, `acceptance.py`, `pfcs.py` | Trial registry, Bonferroni + DSR/PBO diagnostics |
-| Data integrity | `data/`, `research/data_audit.py` | Point-in-time validation, frozen vintages |
-| AI boundary | `research/ai_advisory.py`, `tests/test_ai_hfpc.py` | Advisory-only LLM role, zero authority |
-| Execution venues | `venue.py`, `venue_adapters/alpaca_paper.py` | MockVenue + Alpaca Paper (hardcoded paper=True) |
+| Safety and authority | `core.py`, `authority.py`, `risk.py` | Ledger, authorization, risk veto |
+| Allocation | `allocate/` | Long-only portfolio optimization |
+| Portfolio loop | `orchestrator/` | Decision and paper execution path |
+| Contribution | `meta/contribution.py` | Horizon-isolated after-cost attribution |
+| Probe research | `meta/probe.py` | Disposable paired shadow probes |
+| Promotion | `research/promotion_ledger.py` | One-shot certificates and lifetime budgets |
+| Paired measurement | `research/paired_decision.py` | Counterfactual decision accounting |
+| Research governance | `research/governor.py`, `acceptance.py`, `pfcs.py` | Trial tracking and validation |
+| Data integrity | `data/`, `research/data_audit.py` | PIT checks and frozen data |
+| AI boundary | `research/ai_advisory.py` | Advisory-only analysis |
+| Paper venues | `venue.py`, `venue_adapters/` | Simulated/paper execution |
 
-## Hard safety rules (non-negotiable)
+## Safety invariants
 
-- Long-only, unleveraged, USD, cash is a valid allocation, T+1 settlement.
-- **No live capital.** Alpaca adapter is hardcoded to `paper=True`.
-- The LLM may propose and critique. It may NEVER set weights, override risk, or trade.
-- No component gets permanent authority — everything must keep re-earning it.
+1. No live order routing or live capital.
+2. AI output cannot set portfolio weights, bypass risk, or execute orders.
+3. Risk authority is independent of adaptive model output.
+4. Phase 2 promotion is one-shot and certificate-gated.
+5. A failed or terminal family cannot be reopened by correlation drift.
+6. Lifetime registrations and alpha reservations are not recycled.
+7. Missing, invalid, or incomplete evidence fails closed to cash.
+8. No threshold or protocol change is made solely to obtain a passing result.
 
 ## Quick start
 
+Install project dependencies:
+
 ```bash
 pip install -r quant_m1/requirements.txt
-python -m pytest tests -q          # expect ~509 passed
-```
-
-## Running the paper loop
-
-See `docs/HOW_TO_RUN.md`. The loop is a bounded, restartable batch runner —
-not a live daemon. It never invents market data and stops fail-closed on any
-divergence.
-
-## Honest research status
-
-**No tradeable edge is demonstrated.** The existing 10-ETF panel is
-back-adjusted and non-PIT; the data audit returns `NOT_SUITABLE_FOR_CONFIRMATORY`.
-Results run on yfinance are **exploratory only**. Confirmatory testing requires
-genuine point-in-time data. See `docs/ROUND_9A_PIT_DATA_READINESS_SPEC.md`.

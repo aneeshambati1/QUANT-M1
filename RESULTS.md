@@ -1,7 +1,7 @@
 # QUANT-M1: Research & Infrastructure Memo
 
 **Date:** 2026-11-26  
-**Last verified:** 2026-11-27 at HEAD `274b8ad6b475a9a221db968d36e86cf1964beebb` (documentation update; no frozen research parameter changed).  
+**Last verified:** 2026-11-27 at HEAD `acd7fa49ca5c602e3035587068785e92b839d9f9` (Phase 2 v4 3/6 calibration passing; activation still gated).  
 **Status:** NO TRADEABLE EDGE DEMONSTRATED. INFRASTRUCTURE VALIDATED — PAPER / RESEARCH ONLY.  
 **Panel:** 10 ETFs (SPY, QQQ, IWM, EFA, EEM, TLT, IEF, GLD, USO, UUP), 2015-2024, Daily Closes.
 
@@ -11,7 +11,7 @@
 
 This project set out to build an institutional-grade, autonomous trading infrastructure and discover a cross-sectional momentum edge. 
 
-**The verdict:** The infrastructure was successfully built, validated by an automated test suite and external red-team audits. The authoritative test count is the GitHub Actions `tests` workflow run at the current HEAD (the 414 figure is a historical pre-Phase-2 count and is superseded; a full-suite Colab run at `b23f8fe` on 2026-11-27 reported 558 passed / 0 failed — the authoritative result at any later HEAD is the CI `tests` workflow); historical counts quoted in earlier memos are superseded. However, the research phase yielded **zero survivors** across 13 pre-registered market trials. Subsequent power analysis proved the dataset and time horizon are fundamentally insufficient to detect realistic edge sizes. The search was halted based on pre-declared statistical stopping criteria, not frustration.
+**The verdict:** The infrastructure was successfully built, validated by an automated test suite and external red-team audits. The authoritative test count is the GitHub Actions `tests` workflow run at the current HEAD (the 414 and 558 figures are historical counts at earlier commits and are superseded; a full-suite Colab run at `acd7fa4` on 2026-11-27 reported 565 passed / 0 failed — the authoritative result at any later HEAD is the CI `tests` workflow); historical counts quoted in earlier memos are superseded. However, the research phase yielded **zero survivors** across 13 pre-registered market trials. Subsequent power analysis proved the dataset and time horizon are fundamentally insufficient to detect realistic edge sizes. The search was halted based on pre-declared statistical stopping criteria, not frustration.
 
 ## 2. The Core Finding: Inconclusive, Not Negative
 
@@ -71,7 +71,7 @@ External adversarial audits identified architectural gaps. Current status at the
 - **[P1] Execution State Machine — PARTIALLY RESOLVED.** Explicit `UNKNOWN` state, timeout-stays-ambiguous, snapshot-authoritative fills and partial-fill handling are implemented and tested. A durable venue outbox and restart venue reconciliation (persistent broker exec_ids) remain open (register O-08).
 - **[P1] DSR Integration — OPEN.** DSR and PBO exist in the codebase but are not wired into the primary trial acceptance gate; they require a pre-registered return-series protocol (register O-03). Do not apply DSR to HAC t-stats.
 - **[P2] Horizon Mixing — RESOLVED.** `ContributionTracker` carries a fixed `horizon_days`; mixed-horizon weight resolution fails closed, and per-session attribution only updates horizon-1 trackers. Proven by `test_contribution_types` and the paper-loop driver tests.
-- **[Phase 2] Promotion / probe infrastructure — IMPLEMENTED, DISABLED.** Certificate-gated SE weights, a hash-chained promotion ledger, and an isolated probe journal exist and are tested, but are not wired into live authority. The frozen null suite at 5000 reps fails two checks (AR(1) ρ=0.5 program-wise false-promotion 0.0738 > 0.07; lifetime-48 false-promotion 0.0974 > 0.07); positive-control power is 0.0444. Root causes are protocol inconsistencies, not code bugs. An amendment is PROPOSED (`evidence/phase2_probe_protocol_v3_amendment_PROPOSED.md`), NOT approved. Phase 2 remains disabled; see `docs/DEFECT_REGISTER.md` section F.
+- **[Phase 2] Promotion / probe infrastructure — IMPLEMENTED, CALIBRATED, DISABLED.** Certificate-gated SE weights, a hash-chained promotion ledger (default roster 3 per program / 6 lifetime), and an isolated probe journal exist and are tested; none is wired into live authority. The owner selected the **v4 3/6 design** (`evidence/phase2_probe_protocol_v4.md`): alpha_cell = 0.10/6 = 0.016667, z_cell = 2.1280, N_eval = 399, prewhitened-AR(1) HAC estimator. At the frozen 5000 reps every declared bound passes: program false-promotion 0.0604 / 0.0586 / 0.0552 (IID, AR(1) 0.3, AR(1) 0.5) vs 0.07; per-cell 0.0178 vs 0.026667; lifetime-6 0.1016 vs 0.12; weak-negative 0.0340; cost-domination 0.0078; retirement-by-141 0.9994. Positive-control power is 0.1498 and is reported as INFORMATIONAL — it is weak and is not claimed adequate. The earlier v3 24/48 design failed its lifetime bound and is retained as historical evidence. Phase 2 remains DISABLED pending explicit owner activation approval; see `docs/DEFECT_REGISTER.md` section F.
 
 The paper loop now includes a coordinated, crash-safe session transition and a multi-session driver with per-model leave-one-out after-cost attribution (`run_paper_session`, `run_paper_sessions`). It remains a deterministic session driver, not a live scheduled daemon (register O-07).
 

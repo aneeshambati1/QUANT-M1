@@ -143,10 +143,14 @@ def run_simulation(
         covariance, shrinkage = ledoit_wolf_constant_correlation(returns)
         correlation = np.corrcoef(returns, rowvar=False)
         if n_assets > 1:
-            avg_corr = float(correlation[~np.eye(n_assets, dtype=bool)].mean())
+            avg_corr = float(
+                correlation[~np.eye(n_assets, dtype=bool)].mean()
+            )
         else:
             avg_corr = 0.0
-        vol_ann = float(returns.mean(axis=1).std(ddof=1) * math.sqrt(TRADING_DAYS))
+        vol_ann = float(
+            returns.mean(axis=1).std(ddof=1) * math.sqrt(TRADING_DAYS)
+        )
 
         # Frozen, uncalibrated momentum placeholder; not a validated forecast.
         momentum = panel.iloc[i - 21:i].pct_change().mean()
@@ -236,14 +240,25 @@ def run_simulation(
     buy_hold = last_close / first_close - 1.0
     benchmark = "SPY" if "SPY" in symbols else symbols[0]
     entry_cost = cost_bps / 10_000.0
+
+    benchmark_gross = float(buy_hold[benchmark])
+    benchmark_net = benchmark_gross - entry_cost
+
     baselines = {
         "cash": 0.0,
         "benchmark_symbol": benchmark,
-        "benchmark_buy_hold_gross": float(buy_hold[benchmark]),
-        "benchmark_buy_hold_net": float(buy_hold[benchmark]) - entry_cost,
+        "benchmark_buy_hold_gross": benchmark_gross,
+        "benchmark_buy_hold_net": benchmark_net,
         "equal_weight_gross": float(buy_hold.mean()),
         "equal_weight_net": float(buy_hold.mean()) - entry_cost,
     }
+
+    # Backward-compatible names required by the runner integration contract.
+    # These specifically represent SPY buy-and-hold when SPY is in the panel.
+    if "SPY" in symbols:
+        spy_gross = float(buy_hold["SPY"])
+        baselines["spy_buy_hold_gross"] = spy_gross
+        baselines["spy_buy_hold_net"] = spy_gross - entry_cost
 
     # These are independent conditions: authority does not imply an order,
     # and an order count alone does not establish earned authority.
@@ -299,9 +314,11 @@ def format_report(result: dict) -> str:
         "-" * 64,
         f"Cash baseline: {b['cash']:.2%}",
         f"{b['benchmark_symbol']} buy-and-hold gross/net: "
-        f"{b['benchmark_buy_hold_gross']:.2%}/{b['benchmark_buy_hold_net']:.2%}",
+        f"{b['benchmark_buy_hold_gross']:.2%}/"
+        f"{b['benchmark_buy_hold_net']:.2%}",
         f"Equal-weight gross/net: "
-        f"{b['equal_weight_gross']:.2%}/{b['equal_weight_net']:.2%}",
+        f"{b['equal_weight_gross']:.2%}/"
+        f"{b['equal_weight_net']:.2%}",
         "-" * 64,
     ]
     if s["no_authority"] and s["no_trades"]:
@@ -315,7 +332,9 @@ def format_report(result: dict) -> str:
     elif s["no_trades"]:
         lines.append("RESULT: AUTHORITY PRESENT / NO TRADES.")
     else:
-        lines.append("TRADES OCCURRED — verify earned authority and Risk Kernel approval.")
+        lines.append(
+            "TRADES OCCURRED — verify earned authority and Risk Kernel approval."
+        )
     lines.extend([
         "-" * 64,
         "Limitations:",
@@ -350,7 +369,10 @@ def main() -> None:
         band_frac=args.band_frac,
     )
     print(format_report(result))
-    print(f"Daily ledger: {os.path.join(result['summary']['workdir'], 'daily.csv')}")
+    print(
+        f"Daily ledger: "
+        f"{os.path.join(result['summary']['workdir'], 'daily.csv')}"
+    )
 
 
 if __name__ == "__main__":

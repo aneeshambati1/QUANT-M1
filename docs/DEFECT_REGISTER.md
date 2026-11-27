@@ -93,3 +93,31 @@ No claim of "unbreakable", production-readiness, or a profitable edge is made.
 The guarantee is fail-closed behaviour + bounded authority + tested invariants,
 not invulnerability. ~10% annualized net is a research objective, not a promise.
 The paper loop is a single-step component, not yet a complete autonomous system.
+
+## F. Phase 2 verification (HEAD 274b8ad6b475a9a221db968d36e86cf1964beebb, 2026-11-27)
+
+Full-suite Colab run at b23f8fe (2026-11-27): 558 passed / 0 failed. Fast subset at
+274b8ad (tests/test_phase2.py + tests/test_runner_integration.py): 24 passed.
+
+| ID | Item | Status | Evidence |
+|----|------|--------|----------|
+| P2-01 | Runner baselines KeyError 'spy_buy_hold_gross' | RESOLVED | generic benchmark_* + SPY-conditional spy_* keys; 8/8 integration tests |
+| P2-02 | no_authority vs no_trades conflated | RESOLVED | no_authority from tracker eligibility; no_trades from intent count; separated |
+| P2-03 | Promotion ledger program/lifetime budgets, config freeze, terminal closure, single-writer lock | VERIFIED | 16 phase2 tests pass; thread-lock + thread-local depth + flock; CONFIG record; TERMINAL events |
+| P2-04 | Probe journal separation, immutable families, operational guards, blocked-shadow rejection | VERIFIED | phase2 tests pass; no live authority wiring |
+| P2-05 | SE weights certificate-gated, fail-closed without ledger | VERIFIED | se_weights requires PromotionLedger.is_promoted; excludes terminal |
+| P2-06 | Null suite whole-program + per-cell + frozen reps/seeds | APPLIED | Batch 1 replacement committed; per-cell check added; undeclared LIFETIME_BOUND=0.10 removed |
+| P2-07 | CI null-suite gate | APPLIED | .github/workflows/phase2_null_suite.yml (5000 reps, hashed report artifact) |
+| P2-08 | Null suite calibration FAILS | OPEN — PROTOCOL | 5000 reps: program24_ar0.5 = 0.0738 > 0.07; lifetime48_iid = 0.0974 > 0.07 |
+| P2-09 | Positive-control power | OPEN — PROTOCOL | 0.0444 at z_cell=2.865; no declared numeric floor |
+| P2-10 | Protocol amendment | PROPOSED, NOT APPROVED | evidence/phase2_probe_protocol_v3_amendment_PROPOSED.md |
+
+Root causes of P2-08/P2-09 are protocol inconsistencies, NOT code bugs:
+(1) per-cell Bonferroni-24 across 48 lifetime cells yields theoretical any-false
+rate 1-(1-0.05/24)^48 = 0.0953, incompatible with a 0.07 acceptance bound; the
+protocol declares a lifetime budget (0.10) but no lifetime acceptance bound.
+(2) Bartlett HAC L=21 under-corrects the EWMA-mean variance at AR(1) rho=0.5
+(~2.96x IID inflation), pushing program-wise false promotion above 0.07.
+No frozen parameter has been changed and no threshold tuned to force a pass.
+Phase 2 remains DISABLED pending owner selection of amendment options
+(L1/L2/L3, A1/A2/A3, P1/P2) or a v4 redesign, re-freeze, and a passing 5000-rep suite.

@@ -280,12 +280,8 @@ def audit_panel(
     if not isinstance(close.index, pd.DatetimeIndex):
         return _invalid_report("INDEX_NOT_DATETIME")
 
-    if close.index.hasnans:
-        return _invalid_report("NAT_TIMESTAMP_PRESENT")
-
-    if not close.index.is_monotonic_increasing:
-        return _invalid_report("UNSORTED_TIMESTAMP_INDEX")
-
+    # Record dimensions and duplicate dates before rejecting malformed
+    # ordering. This allows the report to expose both problems when present.
     report.n_symbols = int(close.shape[1])
     report.n_dates = int(close.shape[0])
 
@@ -296,6 +292,14 @@ def audit_panel(
         report.reasons.append(
             f"DUPLICATE_INDEX_DATES:{report.duplicate_dates}"
         )
+
+    if close.index.hasnans:
+        report.reasons.append("NAT_TIMESTAMP_PRESENT")
+        return report
+
+    if not close.index.is_monotonic_increasing:
+        report.reasons.append("UNSORTED_TIMESTAMP_INDEX")
+        return report
 
     # Convert nonnumeric values to NaN so they are counted and rejected.
     numeric = close.apply(pd.to_numeric, errors="coerce")
@@ -445,9 +449,14 @@ def audit_panel(
         report.reasons.append("SURVIVORSHIP_BIAS_NOT_RULED_OUT")
 
     if not report.provenance_evidence_verified:
-        report.reasons.append(
-            "PROVENANCE_EVIDENCE_INCOMPLETE_OR_UNVERIFIED"
-        )
+        if not evidence:
+            report.reasons.append(
+                "PROVENANCE_EVIDENCE_NOT_SUPPLIED"
+            )
+        else:
+            report.reasons.append(
+                "PROVENANCE_EVIDENCE_INCOMPLETE_OR_UNVERIFIED"
+            )
 
     if report.longest_valid_episode < min_valid_episodes:
         report.reasons.append(

@@ -295,9 +295,7 @@ def weights(
         or tracker.horizon_days == selected_horizon
     }
 
-    raw = {name: tracker.raw_weight() for name in selected.items()} if False else {
-        name: tracker.raw_weight() for name, tracker in selected.items()
-    }
+    raw = {name: tracker.raw_weight() for name, tracker in selected.items()}
     total = sum(raw.values())
 
     if total <= 0.0:

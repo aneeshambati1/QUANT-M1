@@ -1,13 +1,31 @@
 #!/usr/bin/env python3
 """Frozen Phase 2 calibration suite; research only.
 
-Simulates the certificate statistic at n=399. Tests program-wide 24-cell
-false promotion and lifetime 48-cell false promotion using bounded-memory
-chunks. This script does not change alpha, z, or acceptance limits to force
-a pass. Any failed check exits nonzero.
+Simulates the certificate statistic at n=399 and evaluates WHOLE programs:
+a replicate fails if ANY registered cell is falsely promoted. Bounded-memory
+chunks keep the run feasible. This script never changes alpha, z, null
+assumptions, or acceptance limits to force a pass. Any failed check exits
+nonzero and Phase 2 stays disabled.
+
+Corrections over the prior revision (verified against the frozen protocol
+evidence/phase2_probe_protocol_v3.md):
+  1. Adds the protocol-declared PER-CELL acceptance check
+     (alpha_cell + 0.01 = 0.0121) that was missing.
+  2. Removes the undeclared LIFETIME_BOUND=0.10. The frozen protocol declares
+     only the program-wide family-wise bound 0.07 and the per-cell bound
+     0.0121. The lifetime procedure is therefore tested against the declared
+     0.07 bound. A lifetime-specific acceptance bound requires an APPROVED
+     protocol amendment; it is not invented here.
+  3. Freezes the replication count (default 5000) and all seeds explicitly,
+     resolving the prior unspecified-replication gap. Ratification of these
+     values in the protocol document is a pending amendment item.
+  4. The positive-control power check remains INFORMATIONAL because the frozen
+     protocol declares no numeric power floor. It is flagged
+     amendment_required=True so the gap cannot be missed; a numeric power gate
+     requires an approved amendment (see proposal). It is NOT silently added.
 
 Run:
-    python scripts/run_null_suite.py --reps 2000
+    python scripts/run_null_suite.py --reps 5000
 """
 from __future__ import annotations
 
@@ -33,11 +51,22 @@ ALPHA_GLOBAL = 0.05
 ALPHA_LIFETIME = 0.10
 ALPHA_CELL = ALPHA_GLOBAL / G_PROGRAM
 Z_CELL = nppf(1.0 - ALPHA_CELL)
-PROGRAM_BOUND = 0.07
-LIFETIME_BOUND = 0.10
+PROGRAM_BOUND = 0.07          # frozen: 0.05 + 0.02
+PER_CELL_BOUND = ALPHA_CELL + 0.01   # frozen: 0.0121
+LIFETIME_BOUND = PROGRAM_BOUND       # declared family-wise bound; amendment pending
 RETIRE_MIN = 120
 RETIRE_BAND = -0.002
 RETIRE_DELTA = 21
+WEAK_MEAN = -0.0002
+COST_MEAN = -0.0005
+STRONG_MEAN = -0.005
+POWER_MEAN = 0.001
+DEFAULT_REPS = 5000
+SEEDS = {
+    "program_iid": 101, "program_ar03": 102, "program_ar05": 103,
+    "per_cell": 104, "lifetime": 201, "weak": 301, "cost": 401,
+    "retire": 501, "power": 601,
+}
 
 
 def wilson_upper(rate: float, reps: int, z: float = 1.6449) -> float:
@@ -45,9 +74,7 @@ def wilson_upper(rate: float, reps: int, z: float = 1.6449) -> float:
         raise ValueError("invalid Wilson inputs")
     den = 1.0 + z * z / reps
     center = (rate + z * z / (2.0 * reps)) / den
-    half = z * math.sqrt(
-        rate * (1.0 - rate) / reps + z * z / (4.0 * reps * reps)
-    ) / den
+    half = z * math.sqrt(rate * (1.0 - rate) / reps + z * z / (4.0 * reps * reps)) / den
     return center + half
 
 
@@ -62,87 +89,70 @@ def cert_stats(x: np.ndarray) -> np.ndarray:
     d = x - x.mean(axis=1, keepdims=True)
     gamma0 = (d * d).mean(axis=1)
     acc = gamma0 * float(w @ w)
-
     for k in range(1, min(LAG, n - 1) + 1):
         gamma_k = (d[:, k:] * d[:, :-k]).mean(axis=1)
         cross = float(w[:-k] @ w[k:])
         acc += 2.0 * (1.0 - k / (LAG + 1)) * gamma_k * cross
-
     var_mean = acc / (W * W)
-    valid = (
-        np.isfinite(var_mean)
-        & (var_mean > 0.0)
-        & np.isfinite(gamma0)
-        & (gamma0 > 0.0)
-    )
+    valid = (np.isfinite(var_mean) & (var_mean > 0.0)
+             & np.isfinite(gamma0) & (gamma0 > 0.0))
     lcb = np.full(len(x), -np.inf)
     lcb[valid] = mhat[valid] - Z_CELL * np.sqrt(var_mean[valid])
     return valid & (lcb > 0.0)
 
 
-def generate(
-    rng: np.random.Generator,
-    batch: int,
-    cells: int,
-    mu: float,
-    rho: float,
-    sigma: float = 0.01,
-) -> np.ndarray:
-    """Generate independent candidate series within each replicate."""
+def generate(rng, batch, cells, mu, rho, sigma=0.01):
     if not -0.999 <= rho <= 0.999:
         raise ValueError("rho outside supported range")
+    if rho == 0.0:
+        return rng.normal(mu, sigma, (batch, cells, N_EVAL))
     x = np.empty((batch, cells, N_EVAL), dtype=np.float64)
     x[:, :, 0] = rng.normal(mu, sigma, (batch, cells))
-    if rho == 0.0:
-        x[:, :, :] = rng.normal(mu, sigma, (batch, cells, N_EVAL))
-        return x
-
-    innovations = rng.normal(
-        0.0, sigma * math.sqrt(1.0 - rho * rho),
-        (batch, cells, N_EVAL),
-    )
+    innov = rng.normal(0.0, sigma * math.sqrt(1.0 - rho * rho),
+                       (batch, cells, N_EVAL))
     for t in range(1, N_EVAL):
-        x[:, :, t] = mu * (1.0 - rho) + rho * x[:, :, t - 1] + innovations[:, :, t]
+        x[:, :, t] = mu * (1.0 - rho) + rho * x[:, :, t - 1] + innov[:, :, t]
     return x
 
 
-def program_false_promotion_rate(
-    reps: int,
-    cells: int,
-    mu: float,
-    rho: float,
-    seed: int,
-    chunk: int,
-) -> float:
+def program_false_promotion_rate(reps, cells, mu, rho, seed, chunk):
     rng = np.random.default_rng(seed)
     false_programs = 0
     done = 0
     while done < reps:
         b = min(chunk, reps - done)
-        x = generate(rng, b, cells, mu, rho)
-        promoted = cert_stats(x.reshape(b * cells, N_EVAL)).reshape(b, cells)
+        x = generate(rng, b, cells, mu, rho).reshape(b * cells, N_EVAL)
+        promoted = cert_stats(x).reshape(b, cells)
         false_programs += int(promoted.any(axis=1).sum())
         done += b
     return false_programs / reps
 
 
-def retirement_detection(reps: int, seed: int, chunk: int) -> float:
+def per_cell_false_rate(reps, mu, rho, seed, chunk):
     rng = np.random.default_rng(seed)
+    false_cells = 0
     total = 0
-    detected = 0
-    length = RETIRE_MIN + RETIRE_DELTA + 40
     while total < reps:
         b = min(chunk, reps - total)
-        x = rng.normal(-0.005, 0.01, (b, length))
-        mean = np.zeros(b)
-        first = np.full(b, length + 1, dtype=np.int32)
+        x = generate(rng, b, 1, mu, rho).reshape(b, N_EVAL)
+        false_cells += int(cert_stats(x).sum())
+        total += b
+    return false_cells / reps
+
+
+def retirement_detection(reps, seed, chunk):
+    rng = np.random.default_rng(seed)
+    length = RETIRE_MIN + RETIRE_DELTA + 40
+    detected = 0
+    total = 0
+    while total < reps:
+        b = min(chunk, reps - total)
+        x = generate(rng, b, 1, STRONG_MEAN, 0.0)[:, 0, :length]
+        m = np.zeros(b)
+        first = np.full(b, 10**9)
         for t in range(length):
-            mean = (1.0 - LAM) * mean + LAM * x[:, t]
-            hit = (
-                (t + 1 >= RETIRE_MIN)
-                & (mean < RETIRE_BAND)
-                & (first > length)
-            )
+            m = (1.0 - LAM) * m + LAM * x[:, t]
+            hit = (t + 1 >= RETIRE_MIN) & (m < RETIRE_BAND) & (first > 10**8)
             first[hit] = t + 1
         detected += int((first <= RETIRE_MIN + RETIRE_DELTA).sum())
         total += b
@@ -151,99 +161,82 @@ def retirement_detection(reps: int, seed: int, chunk: int) -> float:
 
 def main() -> int:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--reps", type=int, default=2000)
+    parser.add_argument("--reps", type=int, default=DEFAULT_REPS)
     parser.add_argument("--chunk", type=int, default=32)
     parser.add_argument("--out", default="evidence/null_suite_report.json")
     args = parser.parse_args()
-
     if args.reps < 100 or args.chunk < 1:
         parser.error("--reps must be >=100 and --chunk must be >=1")
 
     checks = []
 
-    def add_rate(name: str, rate: float, bound: float, reps: int) -> None:
+    def add_rate(name, rate, bound, reps):
         upper = wilson_upper(rate, reps)
-        checks.append({
-            "check": name,
-            "rate": rate,
-            "wilson95_upper": upper,
-            "bound": bound,
-            "pass": bool(upper <= bound),
-        })
+        checks.append({"check": name, "rate": rate, "wilson95_upper": upper,
+                       "bound": bound, "pass": bool(upper <= bound)})
 
-    # One 24-cell program: reject the replicate if ANY cell promotes.
-    for rho, seed in ((0.0, 101), (0.3, 102), (0.5, 103)):
-        rate = program_false_promotion_rate(
-            args.reps, G_PROGRAM, 0.0, rho, seed, args.chunk
-        )
+    for rho, key in ((0.0, "program_iid"), (0.3, "program_ar03"), (0.5, "program_ar05")):
+        rate = program_false_promotion_rate(args.reps, G_PROGRAM, 0.0, rho,
+                                            SEEDS[key], args.chunk)
         add_rate(f"program24_iid_or_ar{rho}", rate, PROGRAM_BOUND, args.reps)
 
-    # Lifetime roster: one 48-cell family of registered opportunities.
-    lifetime_rate = program_false_promotion_rate(
-        args.reps, G_LIFETIME, 0.0, 0.0, 201, args.chunk
-    )
-    add_rate("lifetime48_iid", lifetime_rate, LIFETIME_BOUND, args.reps)
+    per_cell = per_cell_false_rate(args.reps, 0.0, 0.0, SEEDS["per_cell"], args.chunk)
+    add_rate("per_cell_zero_edge", per_cell, PER_CELL_BOUND, args.reps)
 
-    weak_negative = program_false_promotion_rate(
-        args.reps, G_PROGRAM, -0.0002, 0.3, 301, args.chunk
-    )
-    add_rate("program24_weak_negative", weak_negative, PROGRAM_BOUND, args.reps)
+    lifetime = program_false_promotion_rate(args.reps, G_LIFETIME, 0.0, 0.0,
+                                            SEEDS["lifetime"], args.chunk)
+    add_rate("lifetime48_iid", lifetime, LIFETIME_BOUND, args.reps)
 
-    cost_domination = program_false_promotion_rate(
-        args.reps, G_PROGRAM, -0.0005, 0.0, 401, args.chunk
-    )
-    add_rate("program24_cost_domination", cost_domination, PROGRAM_BOUND, args.reps)
+    weak = program_false_promotion_rate(args.reps, G_PROGRAM, WEAK_MEAN, 0.3,
+                                        SEEDS["weak"], args.chunk)
+    add_rate("program24_weak_negative", weak, PROGRAM_BOUND, args.reps)
 
-    retirement = retirement_detection(args.reps, 501, args.chunk)
-    checks.append({
-        "check": "strong_negative_retirement_by_141",
-        "rate": retirement,
-        "bound_min": 0.95,
-        "pass": bool(retirement >= 0.95),
-    })
+    cost = program_false_promotion_rate(args.reps, G_PROGRAM, COST_MEAN, 0.0,
+                                        SEEDS["cost"], args.chunk)
+    add_rate("program24_cost_domination", cost, PROGRAM_BOUND, args.reps)
 
-    # Positive control is disclosure only, not a calibration pass condition.
-    power = program_false_promotion_rate(
-        args.reps, 1, 0.001, 0.3, 601, args.chunk
-    )
-    checks.append({
-        "check": "positive_control_single_cell_power",
-        "rate": power,
-        "informational": True,
-        "pass": True,
-    })
+    retirement = retirement_detection(args.reps, SEEDS["retire"], args.chunk)
+    checks.append({"check": "strong_negative_retirement_by_141",
+                   "rate": retirement, "bound_min": 0.95,
+                   "pass": bool(retirement >= 0.95)})
+
+    power = program_false_promotion_rate(args.reps, 1, POWER_MEAN, 0.3,
+                                         SEEDS["power"], args.chunk)
+    checks.append({"check": "positive_control_single_cell_power",
+                   "rate": power, "informational": True,
+                   "amendment_required": True, "pass": True})
 
     all_pass = all(item["pass"] for item in checks)
     report = {
         "protocol": "phase2_v3_frozen",
         "parameters": {
-            "z_cell": Z_CELL,
-            "alpha_cell": ALPHA_CELL,
-            "alpha_global": ALPHA_GLOBAL,
-            "alpha_lifetime": ALPHA_LIFETIME,
-            "n_eval": N_EVAL,
-            "lag_cap": LAG,
-            "program_cells": G_PROGRAM,
-            "lifetime_cells": G_LIFETIME,
-            "program_bound": PROGRAM_BOUND,
-            "lifetime_bound": LIFETIME_BOUND,
-            "reps": args.reps,
-            "chunk": args.chunk,
+            "z_cell": Z_CELL, "alpha_cell": ALPHA_CELL,
+            "alpha_global": ALPHA_GLOBAL, "alpha_lifetime": ALPHA_LIFETIME,
+            "n_eval": N_EVAL, "lag_cap": LAG,
+            "program_cells": G_PROGRAM, "lifetime_cells": G_LIFETIME,
+            "program_bound": PROGRAM_BOUND, "per_cell_bound": PER_CELL_BOUND,
+            "lifetime_bound": LIFETIME_BOUND, "reps": args.reps,
+            "chunk": args.chunk, "seeds": SEEDS,
+            "weak_mean": WEAK_MEAN, "cost_mean": COST_MEAN,
+            "strong_mean": STRONG_MEAN, "power_mean": POWER_MEAN,
         },
-        "checks": checks,
-        "all_pass": all_pass,
+        "amendment_pending": [
+            "lifetime acceptance bound (currently the declared program bound 0.07)",
+            "numeric positive-control power floor",
+            "ratification of frozen reps=5000 and seeds in the protocol document",
+        ],
+        "checks": checks, "all_pass": all_pass,
     }
     report["sha"] = sha({k: v for k, v in report.items() if k != "sha"})
-
     out_dir = os.path.dirname(args.out)
     if out_dir:
         os.makedirs(out_dir, exist_ok=True)
-    with open(args.out, "w", encoding="utf-8") as handle:
-        json.dump(report, handle, indent=2, sort_keys=True)
-
-    for item in checks:
-        state = "PASS" if item["pass"] else "FAIL"
-        print(f"{state} {item['check']}: {item['rate']:.4f}")
+    with open(args.out, "w") as f:
+        json.dump(report, f, indent=2, sort_keys=True)
+    for c in checks:
+        tag = "PASS" if c["pass"] else "FAIL"
+        extra = " [amendment_required]" if c.get("amendment_required") else ""
+        print(f"{tag}  {c['check']}: {c['rate']:.4f}{extra}")
     print("ALL PASS" if all_pass else "SUITE FAILED — KEEP PHASE 2 DISABLED")
     return 0 if all_pass else 1
 

@@ -1,0 +1,38 @@
+name: phase2-null-suite
+
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - "quant_m1/meta/**"
+      - "quant_m1/research/**"
+      - "scripts/run_null_suite.py"
+      - "evidence/phase2_probe_protocol*"
+  push:
+    branches: [main]
+    paths:
+      - "quant_m1/meta/**"
+      - "quant_m1/research/**"
+      - "scripts/run_null_suite.py"
+      - "evidence/phase2_probe_protocol*"
+
+jobs:
+  null-suite:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.11"
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r quant_m1/requirements.txt
+      - name: Run frozen Phase 2 null suite (5000 reps)
+        run: python scripts/run_null_suite.py --reps 5000 --out evidence/null_suite_report.json
+      - name: Upload hashed calibration report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: phase2-null-suite-report
+          path: evidence/null_suite_report.json

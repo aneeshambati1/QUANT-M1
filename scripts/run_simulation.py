@@ -17,7 +17,7 @@ from quant_m1.system import build
 from quant_m1.universe import etf_instruments
 from quant_m1.meta.state import MarketState
 from quant_m1.meta.contribution import ContributionTracker
-from quant_m1.allocate import solve_allocation
+from quant_m1.allocate.cost_aware import cost_aware_allocator
 from quant_m1.orchestrator.paper_loop import run_paper_step
 from quant_m1.portfolio.covariance import ledoit_wolf_constant_correlation
 
@@ -41,7 +41,7 @@ def load_panel(path: str) -> pd.DataFrame:
 def _nav_cents(ledger, prices: dict) -> int:
     state = ledger.state
     return (
-        state.cash_settled + state.receivable_total()
+        state.cash_settled + state.receivables_total()
         + sum(q * prices[s] for s, q in state.positions.items() if q)
     )
 
@@ -139,7 +139,7 @@ def run_simulation(
         prices = {s: int(round(row[s] * 100)) for s in symbols}
 
         # Both estimates use information ending at i-1.
-        returns = panel.iloc[i - cov_window:i].pct_change().dropna().values
+        returns = panel.iloc[i - cov_window:i].pct_change(fill_method=None).dropna().values
         covariance, shrinkage = ledoit_wolf_constant_correlation(returns)
         correlation = np.corrcoef(returns, rowvar=False)
         if n_assets > 1:
@@ -153,7 +153,7 @@ def run_simulation(
         )
 
         # Frozen, uncalibrated momentum placeholder; not a validated forecast.
-        momentum = panel.iloc[i - 21:i].pct_change().mean()
+        momentum = panel.iloc[i - 21:i].pct_change(fill_method=None).mean()
         ranks = momentum.rank(pct=True).values
         expected_return = np.where(
             ranks > 0.8, 0.001,
@@ -189,13 +189,13 @@ def run_simulation(
             new_trade_date=ledger.state.trade_date + 1,
             new_mark_wall=int(date.timestamp()) + 1,
             new_marks=prices,
-            allocator=solve_allocation,
+            allocator=cost_aware_allocator,
             min_trade_bps=min_trade_bps,
             cost_bps=cost_bps,
         )
 
         nav = ledger.state.nav()
-        cash_value = ledger.state.cash_settled + ledger.state.receivable_total()
+        cash_value = ledger.state.cash_settled + ledger.state.receivables_total()
         gross_value = sum(
             q * prices[s] for s, q in ledger.state.positions.items() if q
         )
@@ -290,6 +290,7 @@ def run_simulation(
         "model_id": MODEL_ID,
         "tracker_snapshot": trackers[MODEL_ID].snapshot(),
         "workdir": workdir,
+        "allocator": "cost_aware_allocator",
     }
     daily.to_csv(os.path.join(workdir, "daily.csv"))
     return {"daily": daily, "summary": summary, "system": sx}
@@ -311,6 +312,7 @@ def format_report(result: dict) -> str:
         f"Mean cash/gross: {s['mean_cash_frac']:.2%}/{s['mean_gross_frac']:.2%}",
         f"Intents: {s['intents_submitted_total']}",
         f"Authority-blocked days: {s['authority_blocks']}/{s['days']}",
+        f"Allocator: {s['allocator']}",
         "-" * 64,
         f"Cash baseline: {b['cash']:.2%}",
         f"{b['benchmark_symbol']} buy-and-hold gross/net: "
@@ -342,6 +344,7 @@ def format_report(result: dict) -> str:
         "- Momentum magnitudes/rank cuts are uncalibrated placeholders.",
         "- Liquidity, ADV, beta, data age, and disagreement use assumptions.",
         "- Phase 2 SE path remains disabled pending null-suite pass and owner approval.",
+        "- Cost-aware allocator engaged; friction reduction is mechanical, not alpha.",
         "=" * 64,
     ])
     return "\n".join(lines)

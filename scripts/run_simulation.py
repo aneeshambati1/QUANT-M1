@@ -30,8 +30,6 @@ from quant_m1.research.survivor_factors import (
     factor_integration_report,
 )
 from quant_m1.meta.selector import select_weights_with_survivors
-from quant_m1.integration.sleeve_probe import process_sleeve_positions
-from quant_m1.integration.selector_executor import apply_selector_weights
 
 MODEL_ID = "mom_21d_h1"
 AUTHORITY_NOTE = "No model has earned positive authority"
@@ -109,7 +107,6 @@ def run_simulation(
     workdir: str | None = None,
     survivor_path: str | None = "evidence/survivor_factors.csv",
     blend_alpha: float = 0.5,
-    enable_sleeve: bool = True,
 ) -> dict:
     if isinstance(cash, bool) or not isinstance(cash, int) or cash <= 0:
         raise ValueError("cash must be positive integer cents")
@@ -160,20 +157,12 @@ def run_simulation(
     survivors = _load_survivors_safe(survivor_path)
     survivor_active = survivors is not None and len(survivors) > 0
 
-    # Define signal families for selector integration
-    signal_families = {
-        "momentum": ["mom_12_1", "mom_6_1"],
-        "reversal": ["rev_5"],
-        "carry": ["carry_fx", "carry_bond"],
-    }
-
     rows = []
     skipped = 0
     cumulative_cost = 0
     cumulative_notional = 0
     authority_blocks = 0
     intents_total = 0
-    sleeve_observations_total = 0
 
     for i in range(start_idx, len(panel)):
         date = panel.index[i]
@@ -228,9 +217,8 @@ def run_simulation(
                 survivor_rep = factor_integration_report(
                     avail, regime=market_state.regime.value
                 )
-                # Apply selector weights to signal families
-                sel_weights = apply_selector_weights(
-                    cost_aware_allocator, survivor_rep, signal_families
+                sel_weights = select_weights_with_survivors(
+                    market_state, survivor_rep, blend_alpha=blend_alpha
                 )
 
         # Use blended selector weights if available, else default
@@ -259,34 +247,6 @@ def run_simulation(
             min_trade_bps=min_trade_bps,
             cost_bps=cost_bps,
         )
-
-        # Sleeve feedback: record observations if enabled
-        sleeve_obs_count = 0
-        if enable_sleeve and report.intents_submitted > 0:
-            # Extract sleeve positions from report
-            sleeve_positions = {}
-            realized_returns = {}
-            for intent in report.intents:
-                sig_name = intent.signal_name
-                position_usd = intent.position_usd
-                if position_usd != 0:
-                    sleeve_positions[sig_name] = {
-                        "position_usd": position_usd,
-                        "selector_weight": sel_weights.get(sig_name, 0.0),
-                    }
-                    # Placeholder realized return (would come from actual backtest)
-                    realized_returns[sig_name] = 0.0
-
-            if sleeve_positions:
-                sleeve_result = process_sleeve_positions(
-                    journal=trackers[MODEL_ID],
-                    sleeve_positions=sleeve_positions,
-                    realized_returns=realized_returns,
-                    cost_bps=cost_bps,
-                    regime=market_state.regime.value,
-                )
-                sleeve_obs_count = sleeve_result["observations_recorded"]
-                sleeve_observations_total += sleeve_obs_count
 
         nav = ledger.state.nav()
         cash_value = ledger.state.cash_settled + ledger.state.receivable_total()
@@ -324,7 +284,6 @@ def run_simulation(
             "note": report.note,
             "survivor_active": survivor_rep is not None,
             "selector_weights": sel_weights,
-            "sleeve_observations": sleeve_obs_count,
         })
 
     daily = pd.DataFrame(rows).set_index("date")
@@ -350,7 +309,6 @@ def run_simulation(
         "equal_weight_net": float(buy_hold.mean()) - entry_cost,
     }
 
-    # Backward-compatible names required by the runner integration contract.
     if "SPY" in symbols:
         spy_gross = float(buy_hold["SPY"])
         baselines["spy_buy_hold_gross"] = spy_gross
@@ -387,8 +345,6 @@ def run_simulation(
         "allocator": "cost_aware_allocator",
         "survivor_wiring": survivor_active,
         "blend_alpha": blend_alpha,
-        "sleeve_enabled": enable_sleeve,
-        "sleeve_observations_total": sleeve_observations_total,
     }
     daily.to_csv(os.path.join(workdir, "daily.csv"))
     return {"daily": daily, "summary": summary, "system": sx}
@@ -412,7 +368,6 @@ def format_report(result: dict) -> str:
         f"Authority-blocked days: {s['authority_blocks']}/{s['days']}",
         f"Allocator: {s['allocator']}",
         f"Survivor wiring: {s.get('survivor_wiring', False)} (alpha={s.get('blend_alpha', 0):.2f})",
-        f"Sleeve enabled: {s.get('sleeve_enabled', False)} (obs={s.get('sleeve_observations_total', 0)})",
         "-" * 64,
         f"Cash baseline: {b['cash']:.2%}",
         f"{b['benchmark_symbol']} buy-and-hold gross/net: "
@@ -446,7 +401,6 @@ def format_report(result: dict) -> str:
         "- Phase 2 SE path remains disabled pending null-suite pass and owner approval.",
         "- Cost-aware allocator engaged; friction reduction is mechanical, not alpha.",
         "- Survivor factors are academic LS returns used as regime indicators only.",
-        "- Sleeve observations are paper-only and do not grant authority directly.",
         "=" * 64,
     ])
     return "\n".join(lines)
@@ -463,8 +417,6 @@ def main() -> None:
     parser.add_argument("--band-frac", type=float, default=0.25)
     parser.add_argument("--survivor-path", default="evidence/survivor_factors.csv")
     parser.add_argument("--blend-alpha", type=float, default=0.5)
-    parser.add_argument("--enable-sleeve", action="store_true", default=True)
-    parser.add_argument("--disable-sleeve", dest="enable_sleeve", action="store_false")
     args = parser.parse_args()
 
     panel = load_panel(args.panel)
@@ -478,7 +430,6 @@ def main() -> None:
         band_frac=args.band_frac,
         survivor_path=args.survivor_path,
         blend_alpha=args.blend_alpha,
-        enable_sleeve=args.enable_sleeve,
     )
     print(format_report(result))
     print(

@@ -71,12 +71,20 @@ def current_weights(ledger, prices: dict, symbols: list) -> np.ndarray:
 
 
 def _load_survivors_safe(path: str | None):
-    """Load survivor factors if available; return None otherwise."""
+    """Load survivor factors if available; return None otherwise.
+
+    Normalizes timezone to UTC so comparisons with panel dates never fail.
+    """
     if path is None:
         return None
     try:
-        return load_survivor_factors(path)
-    except (FileNotFoundError, Exception):
+        sf = load_survivor_factors(path)
+        if sf.index.tzinfo is None:
+            sf.index = sf.index.tz_localize("UTC")
+        else:
+            sf.index = sf.index.tz_convert("UTC")
+        return sf
+    except Exception:
         return None
 
 
@@ -139,7 +147,7 @@ def run_simulation(
         )
     }
 
-    # Load survivor factors once (monthly data, aligned by date)
+    # Load survivor factors once (monthly data, tz-normalized to UTC)
     survivors = _load_survivors_safe(survivor_path)
     survivor_active = survivors is not None and len(survivors) > 0
 
@@ -193,10 +201,10 @@ def run_simulation(
             drawdown_trigger_bps=cfg.mandate.drawdown_trigger_bps,
         )
 
-        # Survivor-aware regime weighting (falls back to pre-reg if no data)
+        # Survivor-aware regime weighting (falls back to pre-reg if no data).
+        # Only uses survivor rows strictly BEFORE this simulation date.
         survivor_rep = None
         if survivor_active:
-            # Use only survivor data available BEFORE this simulation date
             avail = survivors[survivors.index < date]
             if len(avail) >= 12:
                 survivor_rep = factor_integration_report(
@@ -291,6 +299,7 @@ def run_simulation(
         "equal_weight_net": float(buy_hold.mean()) - entry_cost,
     }
 
+    # Backward-compatible names required by the runner integration contract.
     if "SPY" in symbols:
         spy_gross = float(buy_hold["SPY"])
         baselines["spy_buy_hold_gross"] = spy_gross

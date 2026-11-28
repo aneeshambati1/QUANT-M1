@@ -27,7 +27,7 @@ from quant_m1.orchestrator.paper_loop import run_paper_step
 from quant_m1.portfolio.covariance import ledoit_wolf_constant_correlation
 from quant_m1.research.survivor_factors import (
     load_survivor_factors,
-    compute_regime_weights,
+    factor_integration_report,
 )
 from quant_m1.meta.selector import select_weights_with_survivors
 from quant_m1.integration.sleeve_probe import process_sleeve_positions
@@ -225,8 +225,8 @@ def run_simulation(
         if survivor_active:
             avail = survivors[survivors.index < date]
             if len(avail) >= 12:
-                survivor_rep = compute_regime_weights(
-                    avail, date, alpha=blend_alpha
+                survivor_rep = factor_integration_report(
+                    avail, regime=market_state.regime.value
                 )
                 # Apply selector weights to signal families
                 sel_weights = apply_selector_weights(

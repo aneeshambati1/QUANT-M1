@@ -3,227 +3,174 @@
 Connects the bounded exploration sleeve to the ProbeJournal so provisional
 models can earn authority through observed performance.
 
-The sleeve generates paper positions based on signal strength. These positions
-are recorded as observations in the ProbeJournal, which tracks whether the
-sleeve's signals are predictive. If the sleeve demonstrates consistent
-outperformance, the underlying signal models can earn authority.
+Uses the REAL ProbeJournal API: journal.record(candidate, horizon, value).
+Sleeve observations are stored as numeric return values keyed by signal name
+and horizon. Metadata is embedded in the candidate key for auditability.
 
 Safety guarantees:
 - Paper positions only (no live execution)
-- Observations are tagged as "sleeve_exploration" for audit
+- Observations tagged via candidate key prefix "sleeve:"
 - Authority still requires passing promotion thresholds
 - Risk Kernel veto still applies to all positions
 """
+from __future__ import annotations
 
-from typing import Dict, Any
+from typing import Dict, Any, Optional
 import numpy as np
-from datetime import datetime
-from quant_m1.research.probe import ProbeJournal
 
 
 def record_sleeve_observation(
-    journal: ProbeJournal,
+    journal: Any,
     signal_name: str,
-    position: float,
-    realized_return: float,
-    cost_bps: float,
-    regime: str,
-    selector_weight: float,
+    net_return: float,
+    horizon_days: int = 1,
+    selector_weight: float = 0.0,
+    regime: str = "unknown",
 ) -> Dict[str, Any]:
     """Record a single sleeve observation in the ProbeJournal.
 
+    Uses the real journal.record(candidate, horizon, value) API.
+    The candidate key is prefixed with 'sleeve:' for audit trail.
+
     Args:
-        journal: ProbeJournal instance to record into
+        journal: ProbeJournal instance (must have .record() method)
         signal_name: Name of the signal generating this position
-        position: Dollar amount of the paper position
-        realized_return: Actual return realized over the holding period
-        cost_bps: Transaction cost in basis points
-        regime: Market regime when position was taken
+        net_return: Realized return after costs (decimal, e.g. 0.02 for 2%)
+        horizon_days: Holding period in days (default 1)
         selector_weight: Weight assigned by meta-selector (0-1)
+        regime: Market regime when position was taken
 
     Returns:
-        Dict with observation details and journal confirmation
-
-    Safety:
-        - Does not grant authority directly
-        - Observation is tagged for audit trail
-        - Authority promotion still requires threshold crossing
+        Dict with observation details and confirmation
     """
-    # Calculate net return after costs
-    cost_frac = cost_bps / 10000.0
-    net_return = realized_return - cost_frac
+    # Build auditable candidate key
+    candidate = f"sleeve:{signal_name}:{regime}"
 
-    # Prepare observation metadata
-    metadata = {
-        'source': 'sleeve_exploration',
-        'signal_name': signal_name,
-        'regime': regime,
-        'selector_weight': float(selector_weight),
-        'position_usd': float(position),
-        'gross_return': float(realized_return),
-        'net_return': float(net_return),
-        'cost_bps': float(cost_bps),
-        'recorded_at': datetime.utcnow().isoformat() + 'Z',
-    }
-
-    # Record in ProbeJournal
-    # The journal tracks these observations and computes running statistics
-    observation_id = journal.record_observation(
-        signal_name=signal_name,
-        return_value=net_return,
-        metadata=metadata,
-    )
+    # Record using real ProbeJournal API
+    journal.record(candidate, horizon_days, float(net_return))
 
     return {
-        'observation_id': observation_id,
-        'signal_name': signal_name,
-        'net_return': net_return,
-        'recorded': True,
-        'metadata': metadata,
+        "candidate": candidate,
+        "signal_name": signal_name,
+        "horizon_days": horizon_days,
+        "net_return": float(net_return),
+        "selector_weight": float(selector_weight),
+        "regime": regime,
+        "recorded": True,
     }
 
 
 def process_sleeve_positions(
-    journal: ProbeJournal,
+    journal: Any,
     sleeve_positions: Dict[str, Dict[str, Any]],
     realized_returns: Dict[str, float],
     cost_bps: float = 5.0,
-    regime: str = 'unknown',
+    regime: str = "unknown",
+    horizon_days: int = 1,
 ) -> Dict[str, Any]:
     """Process all sleeve positions and record observations.
 
-    This is the main integration point called after each sleeve execution cycle.
-    It takes the positions the sleeve decided to take, the returns those positions
+    Main integration point called after each sleeve execution cycle.
+    Takes positions the sleeve decided to take, the returns those positions
     actually realized, and records them in the ProbeJournal.
 
     Args:
         journal: ProbeJournal instance
         sleeve_positions: Dict mapping signal_name → position details
             Each entry should have: {'position_usd': float, 'selector_weight': float}
-        realized_returns: Dict mapping signal_name → realized return
+        realized_returns: Dict mapping signal_name → realized gross return
         cost_bps: Transaction cost in basis points (default 5.0)
         regime: Current market regime (default 'unknown')
+        horizon_days: Holding period in days (default 1)
 
     Returns:
         Summary dict with counts and statistics
-
-    Example:
-        sleeve_positions = {
-            'momentum_12_1': {'position_usd': 1000.0, 'selector_weight': 0.3},
-            'mean_reversion': {'position_usd': 500.0, 'selector_weight': 0.2},
-        }
-        realized_returns = {
-            'momentum_12_1': 0.02,
-            'mean_reversion': -0.01,
-        }
-        result = process_sleeve_positions(journal, sleeve_positions, realized_returns)
     """
     observations = []
     total_position = 0.0
     weighted_return = 0.0
 
     for signal_name, pos_details in sleeve_positions.items():
-        position_usd = pos_details.get('position_usd', 0.0)
-        selector_weight = pos_details.get('selector_weight', 0.0)
+        position_usd = pos_details.get("position_usd", 0.0)
+        selector_weight = pos_details.get("selector_weight", 0.0)
 
         if position_usd == 0.0:
             continue
 
-        realized_return = realized_returns.get(signal_name, 0.0)
+        gross_return = realized_returns.get(signal_name, 0.0)
+        cost_frac = cost_bps / 10000.0
+        net_return = gross_return - cost_frac
 
-        # Record this observation
         obs = record_sleeve_observation(
             journal=journal,
             signal_name=signal_name,
-            position=position_usd,
-            realized_return=realized_return,
-            cost_bps=cost_bps,
-            regime=regime,
+            net_return=net_return,
+            horizon_days=horizon_days,
             selector_weight=selector_weight,
+            regime=regime,
         )
 
         observations.append(obs)
         total_position += position_usd
-        weighted_return += (position_usd * obs['net_return'])
+        weighted_return += position_usd * net_return
 
-    # Calculate portfolio-level statistics
     portfolio_return = weighted_return / total_position if total_position > 0 else 0.0
 
-    summary = {
-        'observations_recorded': len(observations),
-        'total_position_usd': total_position,
-        'portfolio_net_return': portfolio_return,
-        'regime': regime,
-        'observations': observations,
+    return {
+        "observations_recorded": len(observations),
+        "total_position_usd": float(total_position),
+        "portfolio_net_return": float(portfolio_return),
+        "regime": regime,
+        "horizon_days": horizon_days,
+        "observations": observations,
     }
 
-    return summary
 
-
-def get_sleeve_performance(journal: ProbeJournal, signal_name: str) -> Dict[str, Any]:
+def get_sleeve_performance(journal: Any, signal_name: str, horizon_days: int = 1) -> Dict[str, Any]:
     """Retrieve performance statistics for a signal from sleeve observations.
 
-    Queries the ProbeJournal for all observations tagged as 'sleeve_exploration'
-    for the given signal and computes performance metrics.
+    Queries the ProbeJournal for observations with candidate key matching
+    the given signal name.
 
     Args:
-        journal: ProbeJournal instance
+        journal: ProbeJournal instance (must have .n_obs() and .certificate_tracker())
         signal_name: Name of the signal to query
+        horizon_days: Horizon to query (default 1)
 
     Returns:
-        Dict with performance statistics:
-        - n_observations: Number of sleeve observations
-        - mean_return: Average net return
-        - std_return: Standard deviation of returns
-        - sharpe: Annualized Sharpe ratio
-        - hit_rate: Fraction of positive returns
-        - total_pnl: Sum of all position-weighted returns
-
-    This data is used to determine if the signal has earned authority.
+        Dict with performance statistics
     """
-    # Query journal for sleeve observations of this signal
-    # Note: Actual query method depends on ProbeJournal implementation
-    # This is a placeholder that should be implemented based on your journal API
+    candidate_pattern = f"sleeve:{signal_name}:"
 
-    observations = journal.query_observations(
-        signal_name=signal_name,
-        source='sleeve_exploration',
-    )
+    try:
+        n = journal.n_obs(candidate_pattern, horizon_days)
+    except Exception:
+        n = 0
 
-    if not observations:
+    if n == 0:
         return {
-            'n_observations': 0,
-            'mean_return': 0.0,
-            'std_return': 0.0,
-            'sharpe': 0.0,
-            'hit_rate': 0.0,
-            'total_pnl': 0.0,
+            "signal_name": signal_name,
+            "n_observations": 0,
+            "mean_return": 0.0,
+            "std_return": 0.0,
+            "sharpe": 0.0,
         }
 
-    returns = [obs['net_return'] for obs in observations]
-    positions = [obs['position_usd'] for obs in observations]
+    try:
+        cert = journal.certificate_tracker(candidate_pattern, horizon_days)
+        mean_ret = float(cert.mean) if hasattr(cert, "mean") else 0.0
+        std_ret = float(cert.std) if hasattr(cert, "std") else 0.0
+    except Exception:
+        mean_ret = 0.0
+        std_ret = 0.0
 
-    returns_array = np.array(returns)
-    positions_array = np.array(positions)
-
-    mean_return = float(np.mean(returns_array))
-    std_return = float(np.std(returns_array))
-    hit_rate = float(np.mean(returns_array > 0))
-
-    # Annualized Sharpe (assuming daily observations, 252 trading days)
-    if std_return > 0:
-        sharpe = (mean_return / std_return) * np.sqrt(252)
-    else:
-        sharpe = 0.0
-
-    # Total P&L weighted by position size
-    total_pnl = float(np.sum(positions_array * returns_array))
+    ann_factor = 252.0 / max(horizon_days, 1)
+    sharpe = (mean_ret / std_ret) * np.sqrt(ann_factor) if std_ret > 0 else 0.0
 
     return {
-        'n_observations': len(observations),
-        'mean_return': mean_return,
-        'std_return': std_return,
-        'sharpe': sharpe,
-        'hit_rate': hit_rate,
-        'total_pnl': total_pnl,
+        "signal_name": signal_name,
+        "n_observations": int(n),
+        "mean_return": float(mean_ret),
+        "std_return": float(std_ret),
+        "sharpe": float(sharpe),
     }

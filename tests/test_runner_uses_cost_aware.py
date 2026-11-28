@@ -48,9 +48,11 @@ def test_runner_integration_uses_cost_aware():
 def _panel(n: int = 80) -> pd.DataFrame:
     """Tiny synthetic panel for the runner contract test.
     Includes SPY so the backward-compat SPY baseline keys are exercised.
+    Timezone-aware UTC to match MarketState requirements and the existing
+    test_runner_integration._synthetic_panel convention.
     """
     rng = np.random.default_rng(0)
-    idx = pd.bdate_range("2020-01-01", periods=n)
+    idx = pd.bdate_range("2020-01-01", periods=n, tz="UTC")
     symbols = ["SPY", "QQQ", "TLT"]
     px = 100 * np.exp(np.cumsum(rng.normal(0, 0.01, size=(n, 3)), axis=0))
     df = pd.DataFrame(px, index=idx, columns=symbols)

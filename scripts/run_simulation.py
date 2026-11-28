@@ -20,6 +20,10 @@ from quant_m1.meta.contribution import ContributionTracker
 from quant_m1.allocate.cost_aware import cost_aware_allocator
 from quant_m1.orchestrator.paper_loop import run_paper_step
 from quant_m1.portfolio.covariance import ledoit_wolf_constant_correlation
+from quant_m1.research.survivor_factors import (
+    load_survivor_factors, factor_integration_report,
+)
+from quant_m1.meta.selector import select_weights_with_survivors
 
 MODEL_ID = "mom_21d_h1"
 AUTHORITY_NOTE = "No model has earned positive authority"
@@ -66,6 +70,16 @@ def current_weights(ledger, prices: dict, symbols: list) -> np.ndarray:
     return weights
 
 
+def _load_survivors_safe(path: str | None):
+    """Load survivor factors if available; return None otherwise."""
+    if path is None:
+        return None
+    try:
+        return load_survivor_factors(path)
+    except (FileNotFoundError, Exception):
+        return None
+
+
 def run_simulation(
     panel: pd.DataFrame,
     *,
@@ -77,6 +91,8 @@ def run_simulation(
     band_frac: float = 0.25,
     risk_aversion: float = 2.0,
     workdir: str | None = None,
+    survivor_path: str | None = "evidence/survivor_factors.csv",
+    blend_alpha: float = 0.5,
 ) -> dict:
     if isinstance(cash, bool) or not isinstance(cash, int) or cash <= 0:
         raise ValueError("cash must be positive integer cents")
@@ -122,6 +138,10 @@ def run_simulation(
             horizon_days=1,
         )
     }
+
+    # Load survivor factors once (monthly data, aligned by date)
+    survivors = _load_survivors_safe(survivor_path)
+    survivor_active = survivors is not None and len(survivors) > 0
 
     rows = []
     skipped = 0
@@ -172,6 +192,21 @@ def run_simulation(
             drawdown_bps=drawdown,
             drawdown_trigger_bps=cfg.mandate.drawdown_trigger_bps,
         )
+
+        # Survivor-aware regime weighting (falls back to pre-reg if no data)
+        survivor_rep = None
+        if survivor_active:
+            # Use only survivor data available BEFORE this simulation date
+            avail = survivors[survivors.index < date]
+            if len(avail) >= 12:
+                survivor_rep = factor_integration_report(
+                    avail, regime=market_state.regime.value
+                )
+
+        sel_weights = select_weights_with_survivors(
+            market_state, survivor_rep, blend_alpha=blend_alpha
+        )
+
         forecast = {
             "model_signals": {MODEL_ID: expected_return},
             "cov": covariance,
@@ -179,6 +214,7 @@ def run_simulation(
             "horizon_days": 1,
             "current_weights": current_weights(ledger, prices, symbols),
             "band_frac": band_frac,
+            "selector_weights": sel_weights,
         }
 
         report = run_paper_step(
@@ -228,6 +264,8 @@ def run_simulation(
             "executed_notional_cents": day_notional,
             "blocked": report.blocked,
             "note": report.note,
+            "survivor_active": survivor_rep is not None,
+            "selector_weights": sel_weights,
         })
 
     daily = pd.DataFrame(rows).set_index("date")
@@ -253,15 +291,11 @@ def run_simulation(
         "equal_weight_net": float(buy_hold.mean()) - entry_cost,
     }
 
-    # Backward-compatible names required by the runner integration contract.
-    # These specifically represent SPY buy-and-hold when SPY is in the panel.
     if "SPY" in symbols:
         spy_gross = float(buy_hold["SPY"])
         baselines["spy_buy_hold_gross"] = spy_gross
         baselines["spy_buy_hold_net"] = spy_gross - entry_cost
 
-    # These are independent conditions: authority does not imply an order,
-    # and an order count alone does not establish earned authority.
     no_authority = not any(t.eligible for t in trackers.values())
     no_trades = intents_total == 0
 
@@ -291,6 +325,8 @@ def run_simulation(
         "tracker_snapshot": trackers[MODEL_ID].snapshot(),
         "workdir": workdir,
         "allocator": "cost_aware_allocator",
+        "survivor_wiring": survivor_active,
+        "blend_alpha": blend_alpha,
     }
     daily.to_csv(os.path.join(workdir, "daily.csv"))
     return {"daily": daily, "summary": summary, "system": sx}
@@ -313,6 +349,7 @@ def format_report(result: dict) -> str:
         f"Intents: {s['intents_submitted_total']}",
         f"Authority-blocked days: {s['authority_blocks']}/{s['days']}",
         f"Allocator: {s['allocator']}",
+        f"Survivor wiring: {s.get('survivor_wiring', False)} (alpha={s.get('blend_alpha', 0):.2f})",
         "-" * 64,
         f"Cash baseline: {b['cash']:.2%}",
         f"{b['benchmark_symbol']} buy-and-hold gross/net: "
@@ -345,6 +382,7 @@ def format_report(result: dict) -> str:
         "- Liquidity, ADV, beta, data age, and disagreement use assumptions.",
         "- Phase 2 SE path remains disabled pending null-suite pass and owner approval.",
         "- Cost-aware allocator engaged; friction reduction is mechanical, not alpha.",
+        "- Survivor factors are academic LS returns used as regime indicators only.",
         "=" * 64,
     ])
     return "\n".join(lines)
@@ -359,6 +397,8 @@ def main() -> None:
     parser.add_argument("--cost-bps", type=int, default=5)
     parser.add_argument("--min-trade-bps", type=int, default=5)
     parser.add_argument("--band-frac", type=float, default=0.25)
+    parser.add_argument("--survivor-path", default="evidence/survivor_factors.csv")
+    parser.add_argument("--blend-alpha", type=float, default=0.5)
     args = parser.parse_args()
 
     panel = load_panel(args.panel)
@@ -370,6 +410,8 @@ def main() -> None:
         cost_bps=args.cost_bps,
         min_trade_bps=args.min_trade_bps,
         band_frac=args.band_frac,
+        survivor_path=args.survivor_path,
+        blend_alpha=args.blend_alpha,
     )
     print(format_report(result))
     print(

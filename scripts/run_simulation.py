@@ -41,7 +41,7 @@ def load_panel(path: str) -> pd.DataFrame:
 def _nav_cents(ledger, prices: dict) -> int:
     state = ledger.state
     return (
-        state.cash_settled + state.receivables_total()
+        state.cash_settled + state.receivable_total()
         + sum(q * prices[s] for s, q in state.positions.items() if q)
     )
 
@@ -195,7 +195,7 @@ def run_simulation(
         )
 
         nav = ledger.state.nav()
-        cash_value = ledger.state.cash_settled + ledger.state.receivables_total()
+        cash_value = ledger.state.cash_settled + ledger.state.receivable_total()
         gross_value = sum(
             q * prices[s] for s, q in ledger.state.positions.items() if q
         )
